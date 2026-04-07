@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>导航栏方案 A — 紧凑双行 + Tag 多选</title>
+<style>
+  :root {
+    --bg-primary: #000; --bg-secondary: #1c1c1e; --bg-tertiary: #2c2c2e; --bg-elevated: #3a3a3c;
+    --text-primary: #f5f5f7; --text-secondary: #a1a1a6; --text-tertiary: #636366;
+    --accent: #0a84ff; --accent-hover: #409cff; --orange: #ff9f0a;
+    --separator: rgba(84,84,88,0.65);
+    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    --font-mono: "SF Mono", monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background: var(--bg-primary); color: var(--text-primary); font-family: var(--font-sans); font-size: 15px; }
+
+  .demo-label {
+    position: fixed; top: 12px; right: 16px;
+    background: var(--accent); color: #fff; padding: 4px 14px; border-radius: 20px;
+    font-size: 12px; font-weight: 600; z-index: 999;
+  }
+
+  /* === 第一行 === */
+  .header-row1 {
+    height: 48px;
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    background: var(--bg-secondary);
+    border-bottom: 0.5px solid var(--separator);
+    gap: 12px;
+  }
+  .logo {
+    font-size: 16px; font-weight: 700; white-space: nowrap;
+    letter-spacing: -0.3px;
+  }
+
+  .project-btn {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 8px; cursor: pointer;
+    transition: background .2s;
+  }
+  .project-btn:hover { background: var(--bg-tertiary); }
+  .project-btn .name { font-size: 13px; font-weight: 500; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-btn .arrow { font-size: 10px; color: var(--text-tertiary); }
+
+  .divider { width: 1px; height: 18px; background: var(--separator); flex-shrink: 0; }
+
+  /* 视频源 tag 区域 */
+  .source-tags {
+    display: flex; align-items: center; gap: 6px;
+    flex: 1; overflow-x: auto; scrollbar-width: none;
+  }
+  .source-tags::-webkit-scrollbar { display: none; }
+
+  .stag {
+    display: inline-flex; align-items: center; gap: 4px;
+    height: 28px; padding: 0 12px; border-radius: 999px;
+    background: var(--bg-tertiary); color: var(--text-secondary);
+    font-size: 11px; font-weight: 500; cursor: pointer;
+    transition: all .2s; white-space: nowrap; user-select: none;
+    flex-shrink: 0;
+  }
+  .stag:hover { background: var(--bg-elevated); color: var(--text-primary); }
+  .stag.active { background: var(--accent); color: #fff; }
+  .stag .count { opacity: 0.7; font-size: 10px; }
+
+  /* 灵敏度 */
+  .sensitivity {
+    display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto;
+  }
+  .sensitivity label { font-size: 11px; color: var(--text-tertiary); white-space: nowrap; }
+  .sensitivity input[type=range] {
+    width: 80px; -webkit-appearance: none; height: 3px;
+    background: var(--bg-tertiary); border-radius: 2px;
+  }
+  .sensitivity input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); border: 2px solid var(--bg-secondary);
+    cursor: pointer;
+  }
+  .sensitivity .val { font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); min-width: 18px; text-align: center; }
+
+  /* === 第二行 === */
+  .header-row2 {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    background: var(--bg-primary);
+    border-bottom: 0.5px solid var(--separator);
+    gap: 12px;
+  }
+
+  .seg-ctrl {
+    display: inline-flex; background: var(--bg-tertiary); border-radius: 8px; padding: 2px; gap: 2px;
+  }
+  .seg-ctrl .seg {
+    display: inline-flex; align-items: center; justify-content: center;
+    height: 28px; padding: 0 12px; border-radius: 6px;
+    font-size: 11px; font-weight: 500; color: var(--text-secondary);
+    cursor: pointer; transition: all .2s; user-select: none;
+  }
+  .seg-ctrl .seg:hover { color: var(--text-primary); }
+  .seg-ctrl .seg.active { background: var(--bg-elevated); color: var(--text-primary); box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+
+  /* 占位内容 */
+  .content-placeholder {
+    padding: 60px 20px; text-align: center; color: var(--text-tertiary); font-size: 14px;
+  }
+  .grid-mock {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; padding: 20px;
+  }
+  .grid-mock .card {
+    aspect-ratio: 16/9; background: var(--bg-secondary); border-radius: 10px;
+  }
+
+  .desc {
+    max-width: 800px; margin: 40px auto; padding: 20px; background: var(--bg-secondary); border-radius: 12px;
+    font-size: 13px; line-height: 1.8; color: var(--text-secondary);
+  }
+  .desc h3 { color: var(--text-primary); margin-bottom: 12px; font-size: 15px; }
+  .desc strong { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="demo-label">方案 A</div>
+
+<!-- 第一行 -->
+<div class="header-row1">
+  <span class="logo">NiceCut</span>
+  <div class="project-btn">
+    <span class="name">宣传片项目</span>
+    <span class="arrow">▼</span>
+  </div>
+  <div class="divider"></div>
+  <div class="source-tags">
+    <div class="stag active">全部 <span class="count">42</span></div>
+    <div class="stag">已收藏 <span class="count">8</span></div>
+    <div class="divider"></div>
+    <div class="stag active" onclick="this.classList.toggle('active')">宣传片 <span class="count">18</span></div>
+    <div class="stag" onclick="this.classList.toggle('active')">花絮 <span class="count">12</span></div>
+    <div class="stag" onclick="this.classList.toggle('active')">采访 <span class="count">9</span></div>
+    <div class="stag" onclick="this.classList.toggle('active')">预告片 <span class="count">3</span></div>
+  </div>
+  <div class="sensitivity">
+    <label>灵敏度</label>
+    <input type="range" min="10" max="60" value="27">
+    <span class="val">27</span>
+  </div>
+</div>
+
+<!-- 第二行 -->
+<div class="header-row2">
+  <div class="seg-ctrl">
+    <div class="seg active">时间顺序</div>
+    <div class="seg">动态差异</div>
+  </div>
+  <div class="seg-ctrl">
+    <div class="seg active">全部</div>
+    <div class="seg">近景</div>
+    <div class="seg">远景</div>
+  </div>
+</div>
+
+<!-- 占位网格 -->
+<div class="grid-mock">
+  <div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div>
+  <div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div>
+  <div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div>
+</div>
+
+<!-- 方案说明 -->
+<div class="desc">
+  <h3>方案 A 说明 — 紧凑双行 + Tag 多选</h3>
+  <p><strong>第一行：</strong>NiceCut logo → 项目下拉 → 分隔线 → 「全部 N」「已收藏」→ 分隔线 → 各视频源 tag（可多选，点击 toggle）→ 最右灵敏度</p>
+  <p><strong>第二行：</strong>排序切换（时间/动态）→ 景别切换（全部/近景/远景）</p>
+  <p><strong>特点：</strong></p>
+  <ul>
+    <li>所有视频源标签和「全部」「已收藏」在同一行，操作路径最短</li>
+    <li>视频源 tag 可多选（点击 toggle），数量少于 6 个时一目了然</li>
+    <li>视频源过多时水平滚动</li>
+    <li>灵敏度始终固定在第一行最右侧</li>
+    <li>第二行只放排序和景别，非常简洁</li>
+  </ul>
+  <p><strong>适合场景：</strong>视频源数量较少（2-6个），需要频繁切换多个视频源组合</p>
+</div>
+
+<script>
+document.querySelectorAll('.seg-ctrl').forEach(ctrl => {
+  ctrl.querySelectorAll('.seg').forEach(seg => {
+    seg.onclick = () => {
+      ctrl.querySelectorAll('.seg').forEach(s => s.classList.remove('active'));
+      seg.classList.add('active');
+    };
+  });
+});
+</script>
+</body>
+</html>

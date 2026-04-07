@@ -1,0 +1,35 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 运行时工作空间（用户数据、上传视频等）
+workspace/uploads/
+workspace/projects/
+workspace/projects.json
+
+# DNN 模型文件（太大，start.sh 会自动下载）
+models/*.caffemodel
+
+# macOS 系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# CodeBuddy
+.codebuddy/
+
+# 日志文件
+*.log

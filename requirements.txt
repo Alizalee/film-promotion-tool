@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+python-multipart==0.0.9
+scenedetect[opencv]==0.6.7.1
+opencv-python-headless==4.13.0.92
+numpy==2.4.4
+Pillow==12.2.0

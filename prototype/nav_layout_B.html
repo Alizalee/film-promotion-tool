@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>导航栏方案 B — 面包屑层级 + 下拉多选</title>
+<style>
+  :root {
+    --bg-primary: #000; --bg-secondary: #1c1c1e; --bg-tertiary: #2c2c2e; --bg-elevated: #3a3a3c;
+    --text-primary: #f5f5f7; --text-secondary: #a1a1a6; --text-tertiary: #636366;
+    --accent: #0a84ff; --accent-hover: #409cff; --orange: #ff9f0a;
+    --separator: rgba(84,84,88,0.65);
+    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    --font-mono: "SF Mono", monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background: var(--bg-primary); color: var(--text-primary); font-family: var(--font-sans); font-size: 15px; }
+
+  .demo-label {
+    position: fixed; top: 12px; right: 16px;
+    background: var(--orange); color: #000; padding: 4px 14px; border-radius: 20px;
+    font-size: 12px; font-weight: 600; z-index: 999;
+  }
+
+  /* === 第一行 === */
+  .header-row1 {
+    height: 48px;
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    background: var(--bg-secondary);
+    border-bottom: 0.5px solid var(--separator);
+    gap: 0;
+  }
+  .logo {
+    font-size: 16px; font-weight: 700; white-space: nowrap;
+    letter-spacing: -0.3px; margin-right: 6px;
+  }
+
+  /* 面包屑风格 */
+  .breadcrumb {
+    display: flex; align-items: center; gap: 0; flex: 1; min-width: 0;
+  }
+  .bc-sep {
+    color: var(--text-tertiary); font-size: 11px; margin: 0 4px; user-select: none;
+  }
+  .bc-item {
+    display: flex; align-items: center; gap: 4px;
+    padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 500; color: var(--text-secondary);
+    transition: all .2s; white-space: nowrap;
+  }
+  .bc-item:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+  .bc-item.active { color: var(--text-primary); }
+  .bc-item .arrow { font-size: 9px; color: var(--text-tertiary); margin-left: 2px; }
+  .bc-item .count {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 9px; background: rgba(255,255,255,0.08);
+    font-size: 10px; font-weight: 600; color: var(--text-tertiary);
+  }
+  .bc-item.active .count { background: var(--accent); color: #fff; }
+
+  .bc-fav {
+    color: var(--text-tertiary); font-size: 16px;
+    padding: 4px 8px; border-radius: 6px; cursor: pointer; transition: all .2s;
+  }
+  .bc-fav:hover { background: var(--bg-tertiary); color: var(--orange); }
+  .bc-fav.active { color: var(--orange); }
+
+  /* 视频源下拉多选按钮 */
+  .source-dropdown-btn {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 8px; cursor: pointer;
+    font-size: 12px; font-weight: 500; color: var(--text-secondary);
+    background: var(--bg-tertiary); transition: all .2s;
+    position: relative; white-space: nowrap;
+  }
+  .source-dropdown-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
+  .source-dropdown-btn .badge {
+    background: var(--accent); color: #fff; font-size: 10px; font-weight: 600;
+    padding: 1px 6px; border-radius: 8px; min-width: 16px; text-align: center;
+  }
+
+  /* 下拉面板 */
+  .source-dropdown {
+    position: absolute; top: calc(100% + 6px); left: 0;
+    background: var(--bg-elevated); border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    padding: 8px 0; min-width: 200px; z-index: 100;
+    display: none;
+  }
+  .source-dropdown.open { display: block; animation: dd-in .2s ease-out; }
+  @keyframes dd-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+  .source-dropdown-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px; cursor: pointer; transition: background .15s;
+    font-size: 12px;
+  }
+  .source-dropdown-item:hover { background: rgba(255,255,255,0.05); }
+  .source-dropdown-item .check {
+    width: 18px; height: 18px; border-radius: 4px;
+    border: 2px solid rgba(255,255,255,0.25); display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: transparent; transition: all .15s;
+  }
+  .source-dropdown-item.selected .check {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+  }
+  .source-dropdown-item .sname { flex: 1; color: var(--text-primary); }
+  .source-dropdown-item .scount { color: var(--text-tertiary); font-size: 11px; }
+
+  .divider-line { height: 0.5px; background: var(--separator); margin: 4px 14px; }
+
+  /* 灵敏度 */
+  .sensitivity {
+    display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto;
+  }
+  .sensitivity label { font-size: 11px; color: var(--text-tertiary); white-space: nowrap; }
+  .sensitivity input[type=range] {
+    width: 80px; -webkit-appearance: none; height: 3px;
+    background: var(--bg-tertiary); border-radius: 2px;
+  }
+  .sensitivity input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); border: 2px solid var(--bg-secondary); cursor: pointer;
+  }
+  .sensitivity .val { font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); min-width: 18px; text-align: center; }
+
+  /* === 第二行 === */
+  .header-row2 {
+    height: 40px;
+    display: flex; align-items: center;
+    padding: 0 20px;
+    background: var(--bg-primary);
+    border-bottom: 0.5px solid var(--separator);
+    gap: 12px;
+  }
+
+  .seg-ctrl {
+    display: inline-flex; background: var(--bg-tertiary); border-radius: 8px; padding: 2px; gap: 2px;
+  }
+  .seg-ctrl .seg {
+    display: inline-flex; align-items: center; justify-content: center;
+    height: 28px; padding: 0 12px; border-radius: 6px;
+    font-size: 11px; font-weight: 500; color: var(--text-secondary);
+    cursor: pointer; transition: all .2s; user-select: none;
+  }
+  .seg-ctrl .seg:hover { color: var(--text-primary); }
+  .seg-ctrl .seg.active { background: var(--bg-elevated); color: var(--text-primary); box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+
+  /* 占位 */
+  .grid-mock {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; padding: 20px;
+  }
+  .grid-mock .card { aspect-ratio: 16/9; background: var(--bg-secondary); border-radius: 10px; }
+
+  .desc {
+    max-width: 800px; margin: 40px auto; padding: 20px; background: var(--bg-secondary); border-radius: 12px;
+    font-size: 13px; line-height: 1.8; color: var(--text-secondary);
+  }
+  .desc h3 { color: var(--text-primary); margin-bottom: 12px; font-size: 15px; }
+  .desc strong { color: var(--orange); }
+</style>
+</head>
+<body>
+
+<div class="demo-label">方案 B</div>
+
+<!-- 第一行 -->
+<div class="header-row1">
+  <span class="logo">NiceCut</span>
+  <div class="breadcrumb">
+    <span class="bc-sep">/</span>
+    <div class="bc-item active">
+      <span>宣传片项目</span>
+      <span class="arrow">▼</span>
+    </div>
+    <span class="bc-sep">/</span>
+    <div class="bc-item active">
+      <span>全部</span>
+      <span class="count">42</span>
+    </div>
+    <div class="bc-fav" title="已收藏" onclick="this.classList.toggle('active')">♥</div>
+    <span class="bc-sep">·</span>
+    <div style="position:relative">
+      <div class="source-dropdown-btn" onclick="document.getElementById('srcDD').classList.toggle('open')">
+        视频源
+        <span class="badge">4</span>
+        <span class="arrow" style="font-size:9px;color:var(--text-tertiary)">▼</span>
+      </div>
+      <div class="source-dropdown" id="srcDD">
+        <div class="source-dropdown-item selected" onclick="this.classList.toggle('selected')">
+          <div class="check">✓</div>
+          <span class="sname">宣传片.mp4</span>
+          <span class="scount">18</span>
+        </div>
+        <div class="source-dropdown-item selected" onclick="this.classList.toggle('selected')">
+          <div class="check">✓</div>
+          <span class="sname">花絮.mp4</span>
+          <span class="scount">12</span>
+        </div>
+        <div class="source-dropdown-item selected" onclick="this.classList.toggle('selected')">
+          <div class="check">✓</div>
+          <span class="sname">采访.mp4</span>
+          <span class="scount">9</span>
+        </div>
+        <div class="source-dropdown-item selected" onclick="this.classList.toggle('selected')">
+          <div class="check">✓</div>
+          <span class="sname">预告片.mp4</span>
+          <span class="scount">3</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sensitivity">
+    <label>灵敏度</label>
+    <input type="range" min="10" max="60" value="27">
+    <span class="val">27</span>
+  </div>
+</div>
+
+<!-- 第二行 -->
+<div class="header-row2">
+  <div class="seg-ctrl">
+    <div class="seg active">时间顺序</div>
+    <div class="seg">动态差异</div>
+  </div>
+  <div class="seg-ctrl">
+    <div class="seg active">全部</div>
+    <div class="seg">近景</div>
+    <div class="seg">远景</div>
+  </div>
+</div>
+
+<div class="grid-mock">
+  <div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div>
+  <div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div>
+  <div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div>
+</div>
+
+<div class="desc">
+  <h3>方案 B 说明 — 面包屑层级 + 下拉多选</h3>
+  <p><strong>第一行：</strong>NiceCut / 项目名 ▼ / 「全部 42」 ♥ · 视频源下拉(多选) → 灵敏度</p>
+  <p><strong>第二行：</strong>排序切换 → 景别切换</p>
+  <p><strong>特点：</strong></p>
+  <ul>
+    <li>面包屑导航风格，层级关系清晰：App → 项目 → 筛选</li>
+    <li>「收藏」用一个 ♥ 图标按钮，不占文字空间</li>
+    <li>视频源使用下拉多选面板（Checkbox List），适合视频源较多（6+）的情况</li>
+    <li>下拉面板中可以看到每个视频源的镜头数量</li>
+    <li>按钮上用 badge 数字显示当前选中了几个视频源</li>
+    <li>第一行整体更像一个路径导航</li>
+  </ul>
+  <p><strong>适合场景：</strong>视频源数量较多（6-20个），面包屑风格有利于层级理解</p>
+</div>
+
+<script>
+document.querySelectorAll('.seg-ctrl').forEach(ctrl => {
+  ctrl.querySelectorAll('.seg').forEach(seg => {
+    seg.onclick = () => {
+      ctrl.querySelectorAll('.seg').forEach(s => s.classList.remove('active'));
+      seg.classList.add('active');
+    };
+  });
+});
+// 点击外部关闭下拉
+document.addEventListener('click', e => {
+  const dd = document.getElementById('srcDD');
+  if (dd && !e.target.closest('.source-dropdown-btn') && !e.target.closest('.source-dropdown')) {
+    dd.classList.remove('open');
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>影视剧宣发拉片工具</title>
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/layout.css">
+    <link rel="stylesheet" href="/static/css/components.css">
+</head>
+<body>
+
+<div id="app">
+    <!-- 顶部进度条 -->
+    <div id="topProgressBar" class="progress-bar-top hidden" style="width:0%"></div>
+
+    <!-- 顶部栏 -->
+    <header class="header">
+        <div class="header-left">
+            <span class="header-logo">拉片工具</span>
+        </div>
+        <div class="header-center">
+            <div class="project-selector" id="projectSelector">
+                <div class="project-selector-btn" id="projectSelectorBtn" onclick="toggleProjectDropdown()">
+                    <span class="proj-name" id="currentProjectName">未选择项目</span>
+                    <span class="proj-arrow">▼</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-right">
+            <!-- 设置已合并到项目下拉中 -->
+        </div>
+    </header>
+
+    <!-- 工具栏（有镜头时显示） -->
+    <div class="toolbar hidden" id="toolbar">
+        <div class="toolbar-left">
+            <div class="segmented-control" id="sortControl">
+                <div class="seg-item active" data-sort="time" onclick="setSort('time')">时间顺序</div>
+                <div class="seg-item" data-sort="motion" onclick="setSort('motion')">动态差异</div>
+            </div>
+        </div>
+        <div class="toolbar-center" id="filterTags">
+            <div class="segmented-control" id="shotTypeControl">
+                <div class="seg-item active" data-type="" onclick="setShotTypeFilter('')">全部</div>
+                <div class="seg-item" data-type="近景" onclick="setShotTypeFilter('近景')">近景</div>
+                <div class="seg-item" data-type="远景" onclick="setShotTypeFilter('远景')">远景</div>
+            </div>
+            <div class="filter-divider"></div>
+            <div class="tag" id="filterFavorite" onclick="toggleFavoriteFilter()">已收藏</div>
+            <select class="video-source-select" id="videoSourceSelect" onchange="onVideoSourceChange(this.value)">
+                <option value="">全部视频</option>
+            </select>
+            <div class="filter-divider"></div>
+            <div class="toolbar-threshold">
+                <span class="toolbar-threshold-label">镜头切分灵敏度</span>
+                <input type="range" class="toolbar-threshold-slider" id="thresholdSlider" min="10" max="60" value="27" oninput="onThresholdChange(this.value)">
+                <span class="toolbar-threshold-value" id="thresholdValue">27</span>
+            </div>
+        </div>
+        <div class="toolbar-right">
+            <span class="shot-count" id="shotCount"></span>
+            <button class="btn-text" id="selectModeBtn" onclick="toggleSelectMode()">选择</button>
+        </div>
+    </div>
+
+    <!-- 内容区 -->
+    <div class="content-area" id="contentArea">
+        <!-- 动态内容由 JS 渲染 -->
+    </div>
+
+    <!-- 底部选中操作栏 -->
+    <div class="selection-bar" id="selectionBar">
+        <div class="selection-bar-thumbs" id="selectionBarThumbs"></div>
+        <div class="selection-bar-info" id="selectionBarInfo">已选 0 个</div>
+        <div class="selection-bar-actions">
+            <button class="btn-secondary" onclick="favoriteAllSelected()" style="height:32px;font-size:12px">全部收藏</button>
+            <button class="btn-primary" onclick="openExportPanel()" style="height:32px;font-size:12px">导出镜头</button>
+            <button class="btn-text" onclick="clearSelection()" style="font-size:12px">取消</button>
+        </div>
+    </div>
+
+    <!-- 全屏拖拽遮罩 -->
+    <div class="drag-overlay" id="dragOverlay">
+        <div class="drag-overlay-icon">↓</div>
+        <div class="drag-overlay-text">松开即可导入视频</div>
+    </div>
+
+    <!-- Toast 容器 -->
+    <div class="toast-container" id="toastContainer"></div>
+</div>
+
+<!-- JS 模块 -->
+<script src="/static/js/state.js"></script>
+<script src="/static/js/utils.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/projects.js"></script>
+<script src="/static/js/upload.js"></script>
+<script src="/static/js/shots.js"></script>
+<script src="/static/js/preview.js"></script>
+<script src="/static/js/trim.js"></script>
+<script src="/static/js/export.js"></script>
+
+<script>
+// 应用初始化
+document.addEventListener('DOMContentLoaded', () => {
+    initApp();
+});
+</script>
+</body>
+</html>
