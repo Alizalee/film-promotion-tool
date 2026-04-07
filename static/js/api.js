@@ -51,6 +51,15 @@ const API = {
     },
 
     // ── 视频 ──
+    async checkDuplicateVideos(filenames) {
+        const res = await fetch('/api/check_duplicate_videos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filenames }),
+        });
+        return res.json();
+    },
+
     async uploadVideo(file, onProgress) {
         return new Promise((resolve, reject) => {
             const formData = new FormData();
@@ -92,6 +101,15 @@ const API = {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ video_path: videoPath, threshold }),
+        });
+        return res.json();
+    },
+
+    async analyzeBatchBg(videoPaths, threshold) {
+        const res = await fetch('/api/analyze_batch_bg', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ video_paths: videoPaths, threshold }),
         });
         return res.json();
     },
@@ -224,6 +242,21 @@ const API = {
     async browseDir(path) {
         const query = path ? `?path=${encodeURIComponent(path)}` : '';
         const res = await fetch(`/api/browse_dir${query}`);
+        return res.json();
+    },
+
+    // ── 后台分析状态 ──
+    async getBgTaskStatus() {
+        const res = await fetch('/api/bg_task_status');
+        return res.json();
+    },
+
+    // ── 收藏镜头 clip 补偿 ──
+    async ensureFavoriteClips() {
+        const res = await fetch('/api/ensure_favorite_clips', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
         return res.json();
     },
 };

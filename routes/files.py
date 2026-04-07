@@ -49,9 +49,11 @@ async def get_saved_frame(filename: str):
 
 
 @router.get("/video")
-async def stream_video(request: Request, source: Optional[str] = Query(None)):
+async def stream_video(request: Request, source: Optional[str] = Query(None), shot_id: Optional[str] = Query(None)):
     """
     流式视频播放（支持 Range 请求实现拖动进度条）
+    当 source 指向的源视频不存在时，如果指定了 shot_id，
+    会尝试使用该镜头的预裁剪 clip_file 文件。
     """
     project_id = _get_active_project_or_fail()
 
@@ -62,6 +64,20 @@ async def stream_video(request: Request, source: Optional[str] = Query(None)):
         if not project_data or not project_data.get("video_path"):
             raise HTTPException(status_code=404, detail="没有视频文件")
         video_path = project_data["video_path"]
+
+    # ★ 源视频不存在时，尝试使用 clip_file
+    if not os.path.exists(video_path) and shot_id:
+        project_data = load_project_data(project_id)
+        if project_data:
+            for s in project_data.get("shots", []):
+                if s["id"] == shot_id:
+                    clip_file = s.get("clip_file", "")
+                    if clip_file:
+                        proj_dir = get_project_dir(project_id)
+                        clip_path = os.path.join(proj_dir, "shots", clip_file)
+                        if os.path.exists(clip_path):
+                            video_path = clip_path
+                    break
 
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="视频文件不存在")
@@ -141,29 +157,59 @@ async def get_shot_video(shot_id: str):
     if not shot:
         raise HTTPException(status_code=404, detail="镜头不存在")
 
+    proj_dir = get_project_dir(project_id)
+
     video_path = shot.get("source_video")
     if not video_path or not os.path.exists(video_path):
+        # ★ 源视频不存在时，尝试使用预裁剪的 clip_file
+        clip_file = shot.get("clip_file", "")
+        if clip_file:
+            clip_path = os.path.join(proj_dir, "shots", clip_file)
+            if os.path.exists(clip_path):
+                return FileResponse(
+                    clip_path,
+                    media_type="video/mp4",
+                    filename=f"{shot.get('timecode_display', shot_id).replace(':', '-')}.mp4",
+                )
         raise HTTPException(status_code=404, detail="源视频文件不存在")
 
     # 检查缓存
-    proj_dir = get_project_dir(project_id)
     shots_dir = os.path.join(proj_dir, "shots")
     os.makedirs(shots_dir, exist_ok=True)
     output_path = os.path.join(shots_dir, f"{shot_id}.mp4")
 
-    if not os.path.exists(output_path):
-        # 使用 FFmpeg 异步裁剪
-        start_time = shot["start_time"]
-        duration = shot["duration"]
+    # 检查缓存是否存在 —— 如果缓存存在但入出点已被用户修改，需重新生成
+    # 通过在文件名中编码时间范围来判断缓存是否过期
+    start_time = shot["start_time"]
+    duration = shot["duration"]
+    cache_key = f"{shot_id}_{start_time:.3f}_{duration:.3f}"
+    output_path_versioned = os.path.join(shots_dir, f"{cache_key}.mp4")
+
+    # 如果旧缓存存在但时间不匹配，删除旧缓存
+    if os.path.exists(output_path) and not os.path.exists(output_path_versioned):
+        os.remove(output_path)
+
+    # 优先使用版本化缓存路径
+    final_output = output_path_versioned if not os.path.exists(output_path) else output_path
+
+    if not os.path.exists(final_output):
+        # 精确裁剪：使用双 -ss 策略，避免关键帧偏移导致导出到前后镜头的帧
+        safe_start = max(0, start_time - 5)
+        offset = round(start_time - safe_start, 6)
 
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(start_time),
+            "-ss", str(safe_start),
             "-i", video_path,
+            "-ss", str(offset),
             "-t", str(duration),
-            "-c", "copy",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-c:a", "aac",
+            "-b:a", "192k",
             "-avoid_negative_ts", "make_zero",
-            output_path,
+            final_output,
         ]
 
         process = await asyncio.create_subprocess_exec(
@@ -180,7 +226,7 @@ async def get_shot_video(shot_id: str):
             )
 
     return FileResponse(
-        output_path,
+        final_output,
         media_type="video/mp4",
         filename=f"{shot.get('timecode_display', shot_id).replace(':', '-')}.mp4",
     )
@@ -204,28 +250,87 @@ async def get_shot_video_range(shot_id: str, request: Request):
     if not shot:
         raise HTTPException(status_code=404, detail="镜头不存在")
 
+    proj_dir = get_project_dir(project_id)
     video_path = shot.get("source_video")
+
     if not video_path or not os.path.exists(video_path):
+        # ★ 源视频不存在时，尝试使用预裁剪的 clip_file 做 Range 播放
+        clip_file = shot.get("clip_file", "")
+        if clip_file:
+            clip_path = os.path.join(proj_dir, "shots", clip_file)
+            if os.path.exists(clip_path):
+                # 直接用 clip_file 作为 final_output，跳过裁剪流程
+                file_size = os.path.getsize(clip_path)
+                range_header = request.headers.get("range")
+
+                if range_header:
+                    range_str = range_header.replace("bytes=", "")
+                    parts = range_str.split("-")
+                    start = int(parts[0])
+                    end = int(parts[1]) if parts[1] else file_size - 1
+                    end = min(end, file_size - 1)
+                    content_length = end - start + 1
+
+                    def iter_clip():
+                        with open(clip_path, "rb") as f:
+                            f.seek(start)
+                            remaining = content_length
+                            while remaining > 0:
+                                chunk_size = min(8192, remaining)
+                                data = f.read(chunk_size)
+                                if not data:
+                                    break
+                                remaining -= len(data)
+                                yield data
+
+                    return StreamingResponse(
+                        iter_clip(),
+                        status_code=206,
+                        media_type="video/mp4",
+                        headers={
+                            "Content-Range": f"bytes {start}-{end}/{file_size}",
+                            "Accept-Ranges": "bytes",
+                            "Content-Length": str(content_length),
+                        },
+                    )
+
+                return FileResponse(clip_path, media_type="video/mp4")
         raise HTTPException(status_code=404, detail="源视频文件不存在")
 
     # 先确保裁剪过的视频存在
-    proj_dir = get_project_dir(project_id)
     shots_dir = os.path.join(proj_dir, "shots")
     os.makedirs(shots_dir, exist_ok=True)
     output_path = os.path.join(shots_dir, f"{shot_id}.mp4")
 
-    if not os.path.exists(output_path):
-        start_time = shot["start_time"]
-        duration = shot["duration"]
+    # 缓存版本化：入出点变化后旧缓存需要重新生成
+    start_time = shot["start_time"]
+    duration = shot["duration"]
+    cache_key = f"{shot_id}_{start_time:.3f}_{duration:.3f}"
+    output_path_versioned = os.path.join(shots_dir, f"{cache_key}.mp4")
+
+    if os.path.exists(output_path) and not os.path.exists(output_path_versioned):
+        os.remove(output_path)
+
+    final_output = output_path_versioned if not os.path.exists(output_path) else output_path
+
+    if not os.path.exists(final_output):
+        # 精确裁剪：使用双 -ss 策略，避免关键帧偏移导致导出到前后镜头的帧
+        safe_start = max(0, start_time - 5)
+        offset = round(start_time - safe_start, 6)
 
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(start_time),
+            "-ss", str(safe_start),
             "-i", video_path,
+            "-ss", str(offset),
             "-t", str(duration),
-            "-c", "copy",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-c:a", "aac",
+            "-b:a", "192k",
             "-avoid_negative_ts", "make_zero",
-            output_path,
+            final_output,
         ]
 
         process = await asyncio.create_subprocess_exec(
@@ -235,11 +340,11 @@ async def get_shot_video_range(shot_id: str, request: Request):
         )
         await process.communicate()
 
-    if not os.path.exists(output_path):
+    if not os.path.exists(final_output):
         raise HTTPException(status_code=500, detail="无法生成镜头视频")
 
     # 支持 Range 请求
-    file_size = os.path.getsize(output_path)
+    file_size = os.path.getsize(final_output)
     range_header = request.headers.get("range")
 
     if range_header:
@@ -251,7 +356,7 @@ async def get_shot_video_range(shot_id: str, request: Request):
         content_length = end - start + 1
 
         def iter_file():
-            with open(output_path, "rb") as f:
+            with open(final_output, "rb") as f:
                 f.seek(start)
                 remaining = content_length
                 while remaining > 0:
@@ -273,7 +378,7 @@ async def get_shot_video_range(shot_id: str, request: Request):
             },
         )
 
-    return FileResponse(output_path, media_type="video/mp4")
+    return FileResponse(final_output, media_type="video/mp4")
 
 
 @router.get("/browse_dir")

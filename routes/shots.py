@@ -1,6 +1,8 @@
 """镜头数据 API 路由 — 完整实现"""
 import os
 import cv2
+import asyncio
+import logging
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
@@ -18,9 +20,11 @@ from services.project_manager import (
     get_project_dir,
     update_project_info,
 )
+
+logger = logging.getLogger(__name__)
 from services.scene_detect import extract_frame, save_frame_jpeg, _video_hash, _frame_to_timecode, _frame_to_display_timecode
 from services.face_detect import detect_face_info, detect_face_info_multi_frame
-from services.shot_type_detect import classify_shot_type
+from services.shot_type_detect import classify_shot_type, classify_shot_label
 
 router = APIRouter()
 
@@ -87,7 +91,30 @@ async def get_shots(
             s.get("start_frame", 0)
         ))
 
-    return {"shots": shots, "total": len(shots)}
+    # 收藏总数 & 全量总数：基于全量数据（不受任何筛选条件影响）
+    all_shots = project_data.get("shots", [])
+    total_all = len(all_shots)
+    favorite_count = sum(1 for s in all_shots if s.get("favorite"))
+
+    # 各景别分类计数（基于全量数据，不受筛选影响）
+    shot_type_counts = {}
+    for s in all_shots:
+        st = s.get("shot_type", "")
+        if st:
+            shot_type_counts[st] = shot_type_counts.get(st, 0) + 1
+
+    # ★ 为每个镜头标注源视频是否存在（前端据此决定播放模式）
+    for s in shots:
+        vp = s.get("source_video", "")
+        s["source_video_exists"] = bool(vp and os.path.exists(vp))
+
+    return {
+        "shots": shots,
+        "total": len(shots),
+        "total_all": total_all,
+        "favorite_count": favorite_count,
+        "shot_type_counts": shot_type_counts,
+    }
 
 
 @router.post("/detect_faces")
@@ -141,6 +168,9 @@ async def detect_faces_on_demand():
             shot["face_ratio"] = float(face_info["face_ratio"])
             shot["person_ratio"] = float(face_info.get("person_ratio", 0.0))
             shot["good_composition"] = bool(face_info["good_composition"])
+            shot["face_count"] = int(face_info.get("face_count", 0))
+            shot["person_count"] = int(face_info.get("person_count", 0))
+            shot["per_frame_debug"] = face_info.get("per_frame", {})
 
             # 标记已检测（缓存标志）
             shot["face_detected"] = True
@@ -158,11 +188,11 @@ async def detect_faces_on_demand():
 @router.post("/detect_shot_types")
 async def detect_shot_types():
     """
-    按需景别分析 — 只在用户点击景别筛选标签时触发。
+    按需镜头分类 — 只在用户点击分类筛选标签时触发。
+    - 基于人脸占比分类：近景人像/黄金人像/远景人像/空镜
     - 需先做过人脸检测（如没做过，自动先做人脸检测）
-    - 二分类：近景（face_ratio >= 3%）/ 远景（其余）
     - 结果写回 project data（缓存），下次不再重复
-    - 如果有旧的五分类数据，自动迁移到二分类
+    - 如果有旧的标签数据，自动迁移
     """
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
@@ -172,15 +202,16 @@ async def detect_shot_types():
 
     shots = project_data.get("shots", [])
 
-    # 迁移旧五分类 → 新二分类
+    # 迁移旧标签 → 新标签（旧五档景别 + 旧人物分类标签 → 需要重新检测）
+    # 注意：新标签（近景人像/黄金人像/远景人像/空镜）不在此列表中，避免每次都重新检测
     migrated = 0
+    old_labels = ("特写", "近景", "中景", "远景", "全景", "双人", "群像", "人物", "单人", "多人")
     for s in shots:
         old_type = s.get("shot_type", "")
-        if old_type in ("特写", "中景", "全景"):
-            if old_type == "特写":
-                s["shot_type"] = "近景"
-            else:
-                s["shot_type"] = "远景"
+        if old_type in old_labels:
+            # 旧标签需要清除重新检测
+            s["shot_type"] = ""
+            s["shot_type_detected"] = False
             migrated += 1
 
     # 找出尚未做过景别检测的镜头
@@ -189,11 +220,7 @@ async def detect_shot_types():
     if not pending and migrated == 0:
         return {"detected": 0, "cached": True}
 
-    if not pending and migrated > 0:
-        save_project_data(project_id, project_data)
-        return {"detected": migrated, "cached": False}
-
-    # 先确保人脸检测已完成（景别依赖 face_ratio）
+    # 先确保人脸检测已完成（景别依赖 face_count）
     face_pending = [s for s in pending if not s.get("face_detected", False)]
     if face_pending:
         from collections import defaultdict
@@ -219,17 +246,17 @@ async def detect_shot_types():
                 shot["face_ratio"] = float(face_info["face_ratio"])
                 shot["person_ratio"] = float(face_info.get("person_ratio", 0.0))
                 shot["good_composition"] = bool(face_info["good_composition"])
+                shot["face_count"] = int(face_info.get("face_count", 0))
+                shot["person_count"] = int(face_info.get("person_count", 0))
+                shot["per_frame_debug"] = face_info.get("per_frame", {})
                 shot["face_detected"] = True
 
-    # 所有 pending 镜头进行景别分类（二分类，综合人脸+人体）
+    # 所有 pending 镜头进行分类（基于 face_count + face_ratio）
     detected_count = 0
     for shot in pending:
-        shot["shot_type"] = classify_shot_type(
-            has_person=shot.get("has_person", False),
-            face_ratio=shot.get("face_ratio", 0),
-            frame=None,
-            person_ratio=shot.get("person_ratio", 0),
-        )
+        face_count = shot.get("face_count", 0)
+        face_ratio = shot.get("face_ratio", 0.0)
+        shot["shot_type"] = classify_shot_label(face_count=face_count, face_ratio=face_ratio)
         shot["shot_type_detected"] = True
         detected_count += 1
 
@@ -239,27 +266,152 @@ async def detect_shot_types():
     return {"detected": detected_count + migrated, "cached": False}
 
 
+async def _clip_single_shot(shot: dict, proj_dir: str):
+    """
+    为单个镜头预裁剪独立 MP4 文件。
+    裁剪后的文件保存在项目 shots/ 目录下，并更新镜头的 clip_file 字段。
+    """
+    shots_dir = os.path.join(proj_dir, "shots")
+    os.makedirs(shots_dir, exist_ok=True)
+
+    # 如果已有 clip_file 且文件存在，跳过
+    existing_clip = shot.get("clip_file", "")
+    if existing_clip and os.path.exists(os.path.join(shots_dir, existing_clip)):
+        return True
+
+    video_path = shot.get("source_video", "")
+    if not video_path or not os.path.exists(video_path):
+        return False
+
+    start_time = shot.get("start_time", 0)
+    duration = shot.get("duration", 0)
+    if duration <= 0:
+        return False
+
+    clip_filename = f"{shot['id']}_clip.mp4"
+    clip_path = os.path.join(shots_dir, clip_filename)
+
+    # 使用双 -ss 精确裁剪策略
+    safe_start = max(0, start_time - 5)
+    offset = round(start_time - safe_start, 6)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(safe_start),
+        "-i", video_path,
+        "-ss", str(offset),
+        "-t", str(duration),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-avoid_negative_ts", "make_zero",
+        clip_path,
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+
+        if process.returncode == 0 and os.path.exists(clip_path):
+            shot["clip_file"] = clip_filename
+            logger.info(f"预裁剪镜头: {shot['id']} → {clip_filename}")
+            return True
+        else:
+            logger.warning(f"预裁剪失败: {shot['id']}: {stderr.decode()[:100]}")
+            return False
+    except Exception as e:
+        logger.warning(f"预裁剪异常: {shot['id']}: {e}")
+        return False
+
+
 @router.post("/favorite")
 async def toggle_favorite(req: FavoriteRequest):
-    """切换镜头收藏状态"""
+    """切换镜头收藏状态 — 收藏时自动预裁剪独立 MP4"""
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
 
     if not project_data:
         raise HTTPException(status_code=404, detail="项目数据不存在")
 
+    proj_dir = get_project_dir(project_id)
     found = False
+    target_shot = None
     for shot in project_data.get("shots", []):
         if shot["id"] == req.shot_id:
             shot["favorite"] = req.favorite
+            target_shot = shot
             found = True
             break
 
     if not found:
         raise HTTPException(status_code=404, detail="镜头不存在")
 
+    # ★ 收藏时，如果源视频存在且没有 clip_file，立即预裁剪
+    clip_ready = False
+    if req.favorite and target_shot:
+        clip_ready = await _clip_single_shot(target_shot, proj_dir)
+
     save_project_data(project_id, project_data)
-    return {"success": True, "favorite": req.favorite}
+    return {
+        "success": True,
+        "favorite": req.favorite,
+        "clip_file": target_shot.get("clip_file", "") if target_shot else "",
+    }
+
+
+@router.post("/ensure_favorite_clips")
+async def ensure_favorite_clips():
+    """
+    补偿接口：扫描所有收藏镜头，为缺少 clip_file 的镜头预裁剪。
+    用于修复已有收藏镜头没有 clip_file 导致无法播放/导出的问题。
+    前端在加载镜头时会自动调用此接口。
+    如果源视频不存在且 clip 文件丢失，会清除无效的 clip_file 字段。
+    """
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+
+    if not project_data:
+        return {"success": True, "clipped": 0, "failed": 0}
+
+    proj_dir = get_project_dir(project_id)
+    shots_dir = os.path.join(proj_dir, "shots")
+
+    clipped = 0
+    failed = 0
+    changed = False
+
+    for shot in project_data.get("shots", []):
+        if not shot.get("favorite"):
+            continue
+
+        # 检查是否已有有效的 clip_file
+        existing_clip = shot.get("clip_file", "")
+        if existing_clip and os.path.exists(os.path.join(shots_dir, existing_clip)):
+            continue
+
+        # clip_file 字段有值但文件不存在 → 先清除
+        if existing_clip:
+            shot.pop("clip_file", None)
+            changed = True
+
+        # 尝试预裁剪
+        success = await _clip_single_shot(shot, proj_dir)
+        if success:
+            clipped += 1
+            changed = True
+        else:
+            failed += 1
+
+    if changed:
+        save_project_data(project_id, project_data)
+
+    return {"success": True, "clipped": clipped, "failed": failed}
 
 
 @router.post("/trim_shot")
@@ -286,12 +438,32 @@ async def trim_shot(req: TrimShotRequest):
             # 更新时间码显示
             shot["timecode_display"] = _frame_to_display_timecode(shot["start_frame"], fps)
 
+            # 清除该镜头的缓存裁剪视频（入出点变了，旧缓存已过期）
+            proj_dir = get_project_dir(project_id)
+            shots_cache_dir = os.path.join(proj_dir, "shots")
+            if os.path.isdir(shots_cache_dir):
+                import glob
+                # 删除所有该 shot_id 相关的缓存文件（包括 clip）
+                for cached_file in glob.glob(os.path.join(shots_cache_dir, f"{req.shot_id}*")):
+                    try:
+                        os.remove(cached_file)
+                    except OSError:
+                        pass
+
+            # ★ 清除旧的 clip_file（入出点变了需要重新裁剪）
+            shot.pop("clip_file", None)
+
+            # ★ 如果是收藏镜头，立即重新生成 clip_file
+            if shot.get("favorite"):
+                await _clip_single_shot(shot, proj_dir)
+
             save_project_data(project_id, project_data)
             return {
                 "success": True,
                 "start_time": shot["start_time"],
                 "end_time": shot["end_time"],
                 "duration": shot["duration"],
+                "clip_file": shot.get("clip_file", ""),
             }
 
     raise HTTPException(status_code=404, detail="镜头不存在")
@@ -452,8 +624,13 @@ async def merge_shots(req: MergeShotsRequest):
         "duration": new_duration,
         "has_person": has_person,
         "face_ratio": face_ratio,
+        "face_count": max(shot_a.get("face_count", 0), shot_b.get("face_count", 0)),
+        "person_ratio": max(shot_a.get("person_ratio", 0), shot_b.get("person_ratio", 0)),
         "good_composition": good_composition,
         "motion_score": motion_score,
+        "shot_type": shot_a.get("shot_type", "") or shot_b.get("shot_type", ""),
+        "face_detected": shot_a.get("face_detected", False) and shot_b.get("face_detected", False),
+        "shot_type_detected": shot_a.get("shot_type_detected", False) and shot_b.get("shot_type_detected", False),
         "favorite": shot_a.get("favorite", False) or shot_b.get("favorite", False),
         "saved": False,
         "frame_file": frame_file,

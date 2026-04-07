@@ -25,7 +25,7 @@ function openExportPanel() {
                 <button class="btn-secondary" onclick="browseExportDir()" style="height:36px;white-space:nowrap">浏览</button>
             </div>
             <div class="export-info">
-                将导出 <strong>${selectedShots.size}</strong> 个镜头为 MP4 文件（保留原始画质，FFmpeg 快速裁剪）
+                将导出 <strong>${selectedShots.size}</strong> 个镜头为 MP4 文件（高画质精确裁剪）
             </div>
             <div class="export-progress hidden" id="exportProgress">
                 <div class="export-progress-bar">

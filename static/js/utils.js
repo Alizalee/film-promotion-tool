@@ -118,10 +118,16 @@ function getFrameUrl(frameFile) {
 
 /**
  * 获取视频流 URL
+ * @param {string} sourcePath - 源视频路径
+ * @param {string} [shotId] - 镜头ID（用于源视频不存在时 fallback 到 clip_file）
  */
-function getVideoUrl(sourcePath) {
+function getVideoUrl(sourcePath, shotId) {
     if (sourcePath) {
-        return `/api/video?source=${encodeURIComponent(sourcePath)}`;
+        let url = `/api/video?source=${encodeURIComponent(sourcePath)}`;
+        if (shotId) {
+            url += `&shot_id=${encodeURIComponent(shotId)}`;
+        }
+        return url;
     }
     return '/api/video';
 }
@@ -143,4 +149,32 @@ function debounce(fn, delay) {
         clearTimeout(timer);
         timer = setTimeout(() => fn.apply(this, args), delay);
     };
+}
+
+/**
+ * 侧边栏折叠/展开
+ */
+function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) return;
+    
+    sidebarCollapsed = !sidebarCollapsed;
+    sidebar.classList.toggle('collapsed', sidebarCollapsed);
+    
+    // 更新 selectionBar 的 left 值
+    updateSelectionBarPosition();
+}
+
+/**
+ * 更新 selectionBar 的位置以跟随 sidebar 宽度
+ */
+function updateSelectionBarPosition() {
+    const bar = document.getElementById('selectionBar');
+    if (!bar) return;
+    
+    if (sidebarCollapsed) {
+        bar.style.left = '0';
+    } else {
+        bar.style.left = '220px';
+    }
 }

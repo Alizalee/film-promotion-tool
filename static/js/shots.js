@@ -12,15 +12,79 @@ async function loadShots() {
         };
         if (favoriteOnly) params.favorite_only = true;
         if (searchQuery) params.search = searchQuery;
-        if (sourceVideoFilter) params.source_video = sourceVideoFilter;
         if (shotTypeFilter) params.shot_type = shotTypeFilter;
 
         const data = await API.getShots(params);
-        allShots = data.shots || [];
+        let shots = data.shots || [];
+
+        // ★ 前端多选过滤视频源（sourceVideoFilters 为空时显示全部）
+        if (sourceVideoFilters.size > 0) {
+            shots = shots.filter(s => sourceVideoFilters.has(s.source_video));
+        }
+
+        allShots = shots;
         totalShots = data.total || 0;
+        totalAllShots = data.total_all || data.total || 0;
+        totalFavorites = data.favorite_count || 0;
+
+        // ★ 当有视频源筛选时，需要基于选中视频源重新计算各项计数
+        let filteredShotTypeCounts = data.shot_type_counts || {};
+        if (sourceVideoFilters.size > 0) {
+            if (!shotTypeFilter) {
+                // 没有景别筛选 → 当前请求的 shots 就是全量（仅受收藏/搜索筛选）
+                // 前端过滤后直接统计
+                const allFiltered = (data.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
+                totalAllShots = allFiltered.length;
+                totalFavorites = allFiltered.filter(s => s.favorite).length;
+                filteredShotTypeCounts = {};
+                for (const s of allFiltered) {
+                    const st = s.shot_type || '';
+                    if (st) {
+                        filteredShotTypeCounts[st] = (filteredShotTypeCounts[st] || 0) + 1;
+                    }
+                }
+            } else {
+                // 有景别筛选 → 需要额外请求不带景别筛选的全量数据
+                const allParams = { sort: currentSort };
+                if (favoriteOnly) allParams.favorite_only = true;
+                if (searchQuery) allParams.search = searchQuery;
+                const allData = await API.getShots(allParams);
+                const allFiltered = (allData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
+                totalAllShots = allFiltered.length;
+                totalFavorites = allFiltered.filter(s => s.favorite).length;
+                filteredShotTypeCounts = {};
+                for (const s of allFiltered) {
+                    const st = s.shot_type || '';
+                    if (st) {
+                        filteredShotTypeCounts[st] = (filteredShotTypeCounts[st] || 0) + 1;
+                    }
+                }
+            }
+        }
 
         renderGrid();
         updateShotCount();
+        updateSidebarCounts();
+        updateShotTypeCounts(filteredShotTypeCounts);
+
+        // ★ 检查是否有收藏镜头缺少 clip_file（需要补偿裁剪）
+        const needsClip = allShots.some(s => s.favorite && !s.clip_file);
+        if (needsClip) {
+            // 后台补偿裁剪（不阻塞 UI）
+            API.ensureFavoriteClips().then(result => {
+                if (result.clipped > 0) {
+                    console.log(`已补偿裁剪 ${result.clipped} 个收藏镜头`);
+                    // 重新加载镜头数据以获取更新的 clip_file 字段
+                    API.getShots(params).then(freshData => {
+                        allShots = freshData.shots || [];
+                        totalShots = freshData.total || 0;
+                        renderGrid();
+                    });
+                }
+            }).catch(err => {
+                console.warn('收藏镜头补偿裁剪失败:', err);
+            });
+        }
     } catch (err) {
         console.error('加载镜头失败:', err);
         showToast('加载镜头失败', 'error');
@@ -52,7 +116,8 @@ function renderGrid() {
         const isSelected = selectedShots.has(shot.id);
         const duration = formatDuration(shot.duration || 0);
         const shotType = shot.shot_type || '';
-        const shotTypeLabel = shotType ? `<span class="shot-type-badge">${shotType}</span>` : '';
+        const shotTypeLabel = shotType ? `<span class="shot-hover-tag shot-type-label">${shotType}</span>` : '';
+        const frameUrl = getFrameUrl(shot.frame_file);
 
         return `
             <div class="shot-card ${selectMode ? 'select-mode' : ''} ${isFav ? 'is-favorited' : ''} ${isSelected ? 'is-selected' : ''}" 
@@ -63,7 +128,12 @@ function renderGrid() {
                  onmouseleave="onShotHoverLeave(this, '${shot.id}')"
                  draggable="false">
                 <div class="shot-thumb">
-                    <img src="${getFrameUrl(shot.frame_file)}" 
+                    <!-- 高斯模糊背景层 -->
+                    <div class="shot-thumb-blur">
+                        <img src="${frameUrl}" alt="" loading="lazy">
+                    </div>
+                    <!-- 主缩略图（contain 不裁剪） -->
+                    <img src="${frameUrl}" 
                          alt="Shot ${shot.index}" 
                          loading="lazy"
                          onerror="this.style.display='none'">
@@ -79,13 +149,11 @@ function renderGrid() {
                         ${isFav ? '♥' : '♡'}
                     </button>
 
-                    <!-- 景别标签（hover 时出现） -->
-                    ${shotTypeLabel}
-
-                    <!-- Hover 浮层（仅底部时长） -->
+                    <!-- Hover 浮层（底部：时长 + 景别标签） -->
                     <div class="shot-hover-overlay">
                         <div class="shot-hover-bottom">
-                            <span class="shot-duration-label">${duration}</span>
+                            <span class="shot-hover-tag shot-duration-label">${duration}</span>
+                            ${shotTypeLabel}
                         </div>
                     </div>
                 </div>
@@ -102,33 +170,74 @@ function onShotHoverEnter(cardEl, shotId) {
     if (!shot || !shot.source_video) return;
 
     const thumbDiv = cardEl.querySelector('.shot-thumb');
-    const img = thumbDiv.querySelector('img');
+    // ★ 选主缩略图（直接子 img），而非 blur 层内的 img
+    const img = thumbDiv.querySelector(':scope > img');
+
+    // ★ 判断是否使用 clip 模式（源视频不存在但有预裁剪文件时，时间从 0 开始）
+    const useClipMode = !!shot.clip_file && !shot.source_video_exists;
 
     // 创建 video 元素
     const video = document.createElement('video');
-    video.src = `${getVideoUrl(shot.source_video)}#t=${shot.start_time},${shot.end_time}`;
+    // 如果有 clip_file（源视频已删除的收藏镜头），clip 本身就是裁剪后的完整镜头，不需要 #t 时间片段
+    if (useClipMode) {
+        video.src = getVideoUrl(shot.source_video, shot.id);
+    } else {
+        video.src = `${getVideoUrl(shot.source_video, shot.id)}#t=${shot.start_time},${shot.end_time}`;
+    }
     video.muted = true;
     video.playsInline = true;
     video.preload = 'metadata';
     video.loop = false;
 
-    thumbDiv.insertBefore(video, img.nextSibling);
+    // ★ 将 video 插在主缩略图之后（而非 blur 层内部）
+    if (img) {
+        thumbDiv.insertBefore(video, img.nextSibling);
+    } else {
+        thumbDiv.appendChild(video);
+    }
     hoverVideoElements.set(shotId, video);
 
     video.addEventListener('loadeddata', () => {
-        video.currentTime = shot.start_time;
+        video.currentTime = useClipMode ? 0 : shot.start_time;
         video.play().then(() => {
             video.classList.add('playing');
             if (img) img.classList.add('has-video');
         }).catch(() => {});
     }, { once: true });
 
-    // 播放结束时回到开头循环
-    video.addEventListener('timeupdate', () => {
-        if (video.currentTime >= shot.end_time - 0.05) {
-            video.currentTime = shot.start_time;
+    // 使用 rAF 高频检测出点，避免 timeupdate 延迟导致播放到下一个镜头
+    const hoverEndTime = useClipMode ? shot.duration : shot.end_time;
+    const hoverStartTime = useClipMode ? 0 : shot.start_time;
+    let hoverRAF = null;
+    function checkHoverBoundary() {
+        if (!hoverVideoElements.has(shotId)) {
+            hoverRAF = null;
+            return;
+        }
+        if (!video.paused) {
+            const halfFrame = 1 / (fps * 2);
+            if (video.currentTime >= hoverEndTime - halfFrame) {
+                video.currentTime = hoverStartTime;
+            }
+        }
+        hoverRAF = requestAnimationFrame(checkHoverBoundary);
+    }
+
+    video.addEventListener('play', () => {
+        if (hoverRAF === null) {
+            hoverRAF = requestAnimationFrame(checkHoverBoundary);
         }
     });
+    video.addEventListener('pause', () => {
+        if (hoverRAF !== null) {
+            cancelAnimationFrame(hoverRAF);
+            hoverRAF = null;
+        }
+    });
+
+    // 存储 rAF ID 以便在 hover 离开时清理
+    video._hoverRAF = hoverRAF;
+    video._hoverRAFCheck = checkHoverBoundary;
 }
 
 /**
@@ -137,12 +246,16 @@ function onShotHoverEnter(cardEl, shotId) {
 function onShotHoverLeave(cardEl, shotId) {
     const video = hoverVideoElements.get(shotId);
     if (video) {
+        // 清理 rAF 循环
+        if (video._hoverRAF) {
+            cancelAnimationFrame(video._hoverRAF);
+        }
         video.pause();
         video.remove();
         hoverVideoElements.delete(shotId);
     }
 
-    const img = cardEl.querySelector('.shot-thumb img');
+    const img = cardEl.querySelector('.shot-thumb > img');
     if (img) img.classList.remove('has-video');
 }
 
@@ -157,54 +270,111 @@ function onShotCardClick(event, shotId, index) {
  * 更新镜头计数
  */
 function updateShotCount() {
-    const el = document.getElementById('shotCount');
-    if (el) {
-        el.textContent = `${allShots.length} 个镜头`;
+    // 同步更新 sidebar 计数
+    const sidebarCount = document.getElementById('sidebarShotCount');
+    if (sidebarCount) {
+        sidebarCount.textContent = totalAllShots;
     }
 }
 
 /**
- * 更新视频源下拉选择
+ * 更新视频源 Checkbox 列表（sidebar）
  */
 function updateVideoSourceTags() {
-    const select = document.getElementById('videoSourceSelect');
-    if (!select) return;
+    const container = document.getElementById('videoSourceList');
+    if (!container) return;
 
-    // 保留第一个"全部视频"选项
-    select.innerHTML = '<option value="">全部视频</option>';
-
-    if (videoPaths.length > 1) {
-        select.style.display = '';
-        videoPaths.forEach((vpath) => {
-            const filename = vpath.split('/').pop().split('\\').pop();
-            const shortName = filename.length > 20 ? filename.substring(0, 17) + '...' : filename;
-            const option = document.createElement('option');
-            option.value = vpath;
-            option.textContent = shortName;
-            option.title = filename;
-            if (sourceVideoFilter === vpath) option.selected = true;
-            select.appendChild(option);
-        });
-    } else {
-        select.style.display = 'none';
+    if (videoPaths.length === 0) {
+        container.innerHTML = '<div style="padding:4px 10px;font-size:11px;color:var(--text-tertiary)">暂无视频</div>';
+        return;
     }
+
+    container.innerHTML = videoPaths.map((vpath) => {
+        const filename = vpath.split('/').pop().split('\\').pop();
+        const shortName = filename.length > 18 ? filename.substring(0, 15) + '...' : filename;
+        const isChecked = sourceVideoFilters.size === 0 || sourceVideoFilters.has(vpath);
+        return `
+            <div class="sidebar-item ${isChecked ? 'checked' : ''}" 
+                 data-video-path="${escapeHtml(vpath)}"
+                 onclick="toggleVideoSourceFilter('${escapeHtml(vpath).replace(/'/g, "\\'")}')" 
+                 title="${escapeHtml(filename)}">
+                <div class="sidebar-checkbox">✓</div>
+                <span class="sidebar-label">${escapeHtml(shortName)}</span>
+                <span class="sidebar-item-delete" onclick="event.stopPropagation();deleteVideoItem('${escapeHtml(vpath).replace(/'/g, "\\'")}', '${escapeHtml(filename).replace(/'/g, "\\'")}')" title="删除此视频">✕</span>
+            </div>
+        `;
+    }).join('');
 }
 
 /**
- * 视频源下拉变更
+ * 切换视频源筛选（多选 checkbox）
  */
-function onVideoSourceChange(value) {
-    sourceVideoFilter = value || null;
+function toggleVideoSourceFilter(vpath) {
+    if (sourceVideoFilters.size === 0) {
+        // 当前显示全部 → 反转为只取消勾选此项（即选中其它全部）
+        videoPaths.forEach(p => {
+            if (p !== vpath) sourceVideoFilters.add(p);
+        });
+    } else if (sourceVideoFilters.has(vpath)) {
+        sourceVideoFilters.delete(vpath);
+        // 如果取消后为空，恢复为全部
+        if (sourceVideoFilters.size === 0) {
+            // 显示全部 → set 保持为空
+        }
+    } else {
+        sourceVideoFilters.add(vpath);
+        // 如果全部选中，恢复为空（=全部）
+        if (sourceVideoFilters.size === videoPaths.length) {
+            sourceVideoFilters.clear();
+        }
+    }
+    updateVideoSourceTags();
     loadShots();
+}
+
+/**
+ * 更新侧边栏各处计数
+ */
+function updateSidebarCounts() {
+    // 全部镜头数（项目全量，不受筛选条件影响）
+    const shotCountBadge = document.getElementById('sidebarShotCount');
+    if (shotCountBadge) shotCountBadge.textContent = totalAllShots;
+
+    // 已收藏数（项目全量收藏数，不受筛选条件影响）
+    const favCountBadge = document.getElementById('sidebarFavCount');
+    if (favCountBadge) favCountBadge.textContent = totalFavorites;
+}
+
+/**
+ * 更新景别筛选标签上的计数
+ */
+function updateShotTypeCounts(counts) {
+    // "全部" 标签显示总数
+    const countAll = document.getElementById('countAll');
+    if (countAll) countAll.textContent = totalAllShots > 0 ? totalAllShots : '';
+
+    // 各分类计数
+    const mapping = {
+        'countCloseUp': '近景人像',
+        'countGolden': '黄金人像',
+        'countWidePortrait': '远景人像',
+        'countEmpty': '空镜',
+    };
+    for (const [elemId, typeName] of Object.entries(mapping)) {
+        const el = document.getElementById(elemId);
+        if (el) {
+            const n = counts[typeName] || 0;
+            el.textContent = n > 0 ? n : '';
+        }
+    }
 }
 
 /**
  * 排序切换
  */
 function setSort(sort) {
-    if (currentSort === sort) return;  // 防止重复点击
     currentSort = sort;
-    document.querySelectorAll('#sortControl .seg-item').forEach(el => {
+    document.querySelectorAll('#sortControl .filter-chip').forEach(el => {
         el.classList.toggle('active', el.dataset.sort === sort);
     });
     showToast(sort === 'motion' ? '按动态差异排序' : '按时间顺序排序');
@@ -212,34 +382,47 @@ function setSort(sort) {
 }
 
 /**
- * 收藏筛选切换
+ * 设置收藏筛选（sidebar 中全部/已收藏互斥）
  */
-function toggleFavoriteFilter() {
-    favoriteOnly = !favoriteOnly;
-    document.getElementById('filterFavorite').classList.toggle('active', favoriteOnly);
+function setFavoriteFilter(onlyFav) {
+    favoriteOnly = onlyFav;
+    
+    // 更新 sidebar 视觉
+    const filterAll = document.getElementById('filterAll');
+    const filterFav = document.getElementById('filterFavorite');
+    if (filterAll) filterAll.classList.toggle('active', !favoriteOnly);
+    if (filterFav) filterFav.classList.toggle('active', favoriteOnly);
+    
     loadShots();
 }
 
 /**
- * 景别筛选切换（分段控件：全部 / 近景 / 远景）
+ * 兼容旧的 toggleFavoriteFilter 调用
+ */
+function toggleFavoriteFilter() {
+    setFavoriteFilter(!favoriteOnly);
+}
+
+/**
+ * 镜头分类筛选切换（分段控件：全部 / 近景人像 / 黄金人像 / 远景人像 / 空镜）
  */
 async function setShotTypeFilter(type) {
-    // 首次选择非"全部"时触发景别分析
+    // 首次选择非"全部"时触发分类分析
     if (type && !shotTypeDetected) {
         shotTypeDetecting = true;
-        showToast('正在分析景别，首次需要几秒钟…');
+        showToast('正在分析镜头分类，首次需要几秒钟…');
 
         try {
             const result = await API.detectShotTypes();
             shotTypeDetected = true;
             if (result.cached) {
-                showToast('景别分析完成（缓存）', 'success');
+                showToast('分类分析完成（缓存）', 'success');
             } else {
-                showToast(`已分析 ${result.detected} 个镜头的景别`, 'success');
+                showToast(`已分析 ${result.detected} 个镜头`, 'success');
             }
         } catch (err) {
-            console.error('景别分析失败:', err);
-            showToast('景别分析失败', 'error');
+            console.error('分类分析失败:', err);
+            showToast('分类分析失败', 'error');
             shotTypeDetecting = false;
             return;
         } finally {
@@ -250,7 +433,7 @@ async function setShotTypeFilter(type) {
     shotTypeFilter = type || null;
 
     // 更新分段控件视觉
-    document.querySelectorAll('#shotTypeControl .seg-item').forEach(el => {
+    document.querySelectorAll('#shotTypeControl .filter-chip').forEach(el => {
         el.classList.toggle('active', el.dataset.type === (shotTypeFilter || ''));
     });
 
@@ -262,9 +445,20 @@ async function setShotTypeFilter(type) {
  */
 async function toggleFavorite(shotId, favorite) {
     try {
-        await API.toggleFavorite(shotId, favorite);
+        const result = await API.toggleFavorite(shotId, favorite);
         const shot = allShots.find(s => s.id === shotId);
-        if (shot) shot.favorite = favorite;
+        if (shot) {
+            shot.favorite = favorite;
+            // ★ 更新 clip_file（收藏时后端会自动预裁剪）
+            if (result.clip_file) {
+                shot.clip_file = result.clip_file;
+            }
+        }
+
+        // ★ 即时更新收藏计数
+        totalFavorites += favorite ? 1 : -1;
+        if (totalFavorites < 0) totalFavorites = 0;
+        updateSidebarCounts();
 
         // 局部更新当前卡片的收藏按钮
         const card = document.querySelector(`.shot-card[data-shot-id="${shotId}"]`);
@@ -368,6 +562,7 @@ function updateSelectionBar() {
     }
 
     bar.classList.add('visible');
+    updateSelectionBarPosition();
     info.textContent = `已选 ${selectedShots.size} 个`;
 
     // 渲染已选缩略图
@@ -395,14 +590,39 @@ async function favoriteAllSelected() {
         await API.batchFavorite(Array.from(selectedShots), true);
         
         // 更新本地数据
+        let newlyFavorited = 0;
         selectedShots.forEach(id => {
             const shot = allShots.find(s => s.id === id);
-            if (shot) shot.favorite = true;
+            if (shot && !shot.favorite) {
+                shot.favorite = true;
+                newlyFavorited++;
+            }
         });
         
+        // ★ 更新收藏计数
+        totalFavorites += newlyFavorited;
+        updateSidebarCounts();
+
         showToast(`已收藏 ${selectedShots.size} 个镜头`, 'success');
         renderGrid();
     } catch (err) {
         showToast('批量收藏失败', 'error');
+    }
+}
+
+/**
+ * 视图大小切换（大/中/小）
+ */
+function setGridSize(size) {
+    gridSize = size;
+    // 更新控件高亮
+    document.querySelectorAll('#gridSizeControl .filter-chip').forEach(el => {
+        el.classList.toggle('active', el.dataset.size === size);
+    });
+    // 更新网格 class
+    const grid = document.getElementById('shotsGrid');
+    if (grid) {
+        grid.classList.remove('grid-sm', 'grid-md', 'grid-lg');
+        grid.classList.add('grid-' + size);
     }
 }

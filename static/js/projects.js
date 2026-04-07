@@ -26,6 +26,9 @@ async function loadProjects() {
             const proj = allProjects.find(p => p.id === currentProjectId);
             currentProjectName = proj ? proj.name : '';
             document.getElementById('currentProjectName').textContent = currentProjectName || '未选择项目';
+            // 同步更新 topbar 项目名
+            const topbarName = document.getElementById('topbarProjectName');
+            if (topbarName) topbarName.textContent = currentProjectName || '未选择项目';
             await initProjectView();
         } else if (allProjects.length > 0) {
             // 有项目但没有活跃项目，切换到第一个
@@ -50,7 +53,27 @@ async function initProjectView() {
     personFilter = false;
     shotTypeDetected = false;
     shotTypeDetecting = false;
+    shotTypeFilter = null;
+    currentSort = 'time';
     thresholdChanged = false;
+    sourceVideoFilters.clear();
+
+    // 同步排序控件 UI
+    document.querySelectorAll('#sortControl .filter-chip').forEach(el => {
+        el.classList.toggle('active', el.dataset.sort === 'time');
+    });
+    // 同步分类筛选控件 UI
+    document.querySelectorAll('#shotTypeControl .filter-chip').forEach(el => {
+        el.classList.toggle('active', el.dataset.type === '');
+    });
+
+    // 同步收藏筛选 UI
+    favoriteOnly = false;
+    const filterAll = document.getElementById('filterAll');
+    const filterFav = document.getElementById('filterFavorite');
+    if (filterAll) filterAll.classList.add('active');
+    if (filterFav) filterFav.classList.remove('active');
+
     const personBtn = document.getElementById('filterPerson');
     if (personBtn) {
         personBtn.classList.remove('active', 'loading');
@@ -73,6 +96,7 @@ async function initProjectView() {
             updateVideoSourceTags();
         } else {
             showEmptyProjectView();
+            updateVideoSourceTags();
         }
     } catch (err) {
         console.error('加载项目信息失败:', err);
@@ -85,12 +109,11 @@ async function initProjectView() {
  */
 function showNoProjectState() {
     const content = document.getElementById('contentArea');
-    document.getElementById('toolbar').classList.add('hidden');
 
     content.innerHTML = `
         <div class="no-project-state">
             <div style="font-size:48px;opacity:0.3">🎬</div>
-            <h2>开始使用拉片工具</h2>
+            <h2>开始使用 Nice Cut</h2>
             <p>创建一个项目来管理你的视频素材</p>
             <button class="btn-primary" onclick="showCreateProjectModal()">创建项目</button>
         </div>
@@ -102,7 +125,6 @@ function showNoProjectState() {
  */
 function showEmptyProjectView() {
     const content = document.getElementById('contentArea');
-    document.getElementById('toolbar').classList.add('hidden');
 
     content.innerHTML = `
         <div class="empty-guide">
@@ -110,7 +132,6 @@ function showEmptyProjectView() {
             <div class="empty-guide-text">拖入视频文件，或点击选择</div>
             <div class="empty-guide-sub">支持 MP4、MOV、AVI 等格式</div>
             <button class="btn-primary" onclick="triggerFileSelect()">选择视频文件</button>
-            <input type="file" id="fileInput" accept="video/*" multiple style="display:none" onchange="handleFileSelect(event)">
         </div>
     `;
 }
@@ -120,45 +141,26 @@ function showEmptyProjectView() {
  */
 function showShotsView() {
     const content = document.getElementById('contentArea');
-    document.getElementById('toolbar').classList.remove('hidden');
 
     // 确保内容区有网格容器
     if (!content.querySelector('.shots-grid')) {
-        content.innerHTML = '<div class="shots-grid" id="shotsGrid"></div>';
+        content.innerHTML = `<div class="shots-grid grid-${gridSize}" id="shotsGrid"></div>`;
     }
 }
 
 /**
- * 显示分析进度（步骤进度条）
+ * 显示分析进度（简洁版 — 仅加载动画 + 预估时间）
  */
-function showAnalyzeProgress(text = '正在检测场景…', step = 1) {
+function showAnalyzeProgress(text = '正在分析视频…', estSeconds = 0) {
     const content = document.getElementById('contentArea');
-    document.getElementById('toolbar').classList.add('hidden');
 
-    const steps = [
-        { label: '上传中', icon: '📤' },
-        { label: '场景检测', icon: '🎬' },
-        { label: '提取封面帧', icon: '🖼' },
-        { label: '计算动态值', icon: '📊' },
-        { label: '完成', icon: '✅' },
-    ];
-
-    const stepsHtml = steps.map((s, i) => {
-        const idx = i + 1;
-        let cls = 'step-item';
-        if (idx < step) cls += ' completed';
-        else if (idx === step) cls += ' active';
-        return `<div class="${cls}">
-            <div class="step-dot">${idx < step ? '✓' : idx}</div>
-            <div class="step-label">${s.label}</div>
-        </div>`;
-    }).join('<div class="step-connector"></div>');
+    const estText = estSeconds > 0 ? `<div class="analyze-est-time">预计 ${estSeconds} 秒</div>` : '';
 
     content.innerHTML = `
         <div class="analyze-progress">
             <div class="spinner"></div>
             <div class="analyze-progress-text">${text}</div>
-            <div class="analyze-steps">${stepsHtml}</div>
+            ${estText}
             <button class="btn-cancel-analyze" onclick="cancelAnalyze()">取消分析</button>
         </div>
     `;
@@ -170,15 +172,15 @@ function showAnalyzeProgress(text = '正在检测场景…', step = 1) {
 function toggleProjectDropdown() {
     projectDropdownOpen = !projectDropdownOpen;
     const btn = document.getElementById('projectSelectorBtn');
-    const selector = document.getElementById('projectSelector');
 
     if (projectDropdownOpen) {
         btn.classList.add('open');
         renderProjectDropdown();
     } else {
         btn.classList.remove('open');
-        const dropdown = selector.querySelector('.project-dropdown');
+        const dropdown = document.body.querySelector('.project-dropdown');
         if (dropdown) dropdown.remove();
+        document.removeEventListener('click', closeDropdownOnClickOutside);
     }
 }
 
@@ -188,7 +190,7 @@ function toggleProjectDropdown() {
 function renderProjectDropdown() {
     const selector = document.getElementById('projectSelector');
     // 移除已有下拉
-    const old = selector.querySelector('.project-dropdown');
+    const old = document.body.querySelector('.project-dropdown');
     if (old) old.remove();
 
     const dropdown = document.createElement('div');
@@ -200,10 +202,11 @@ function renderProjectDropdown() {
         const meta = `${proj.shot_count || 0} 个镜头 · ${proj.video_count || 0} 个视频`;
         html += `
             <div class="project-dropdown-item ${isActive ? 'active' : ''}" onclick="switchToProject('${proj.id}')">
-                <div>
+                <div style="flex:1;min-width:0">
                     <div class="proj-item-name">${escapeHtml(proj.name)}</div>
                     <div class="proj-item-meta">${meta}</div>
                 </div>
+                <span class="proj-item-delete" onclick="event.stopPropagation();deleteProject('${proj.id}', '${escapeHtml(proj.name).replace(/'/g, "\\'")}')" title="删除项目">✕</span>
             </div>
         `;
     });
@@ -233,7 +236,8 @@ function renderProjectDropdown() {
     `;
 
     dropdown.innerHTML = html;
-    selector.appendChild(dropdown);
+    // 使用 body 作为容器（固定定位），避免被 sidebar overflow 裁剪
+    document.body.appendChild(dropdown);
 
     // 加载视频管理列表
     loadVideoList();
@@ -246,10 +250,10 @@ function renderProjectDropdown() {
 
 function closeDropdownOnClickOutside(e) {
     const selector = document.getElementById('projectSelector');
-    if (!selector.contains(e.target)) {
+    const dropdown = document.body.querySelector('.project-dropdown');
+    if (!selector.contains(e.target) && (!dropdown || !dropdown.contains(e.target))) {
         projectDropdownOpen = false;
         document.getElementById('projectSelectorBtn').classList.remove('open');
-        const dropdown = selector.querySelector('.project-dropdown');
         if (dropdown) dropdown.remove();
         document.removeEventListener('click', closeDropdownOnClickOutside);
     }
@@ -270,11 +274,14 @@ async function switchToProject(projectId) {
         const proj = allProjects.find(p => p.id === projectId);
         currentProjectName = proj ? proj.name : '';
         document.getElementById('currentProjectName').textContent = currentProjectName;
+        // 同步更新 topbar 项目名
+        const topbarName = document.getElementById('topbarProjectName');
+        if (topbarName) topbarName.textContent = currentProjectName;
 
         // 关闭下拉
         projectDropdownOpen = false;
         document.getElementById('projectSelectorBtn').classList.remove('open');
-        const dropdown = document.querySelector('.project-dropdown');
+        const dropdown = document.body.querySelector('.project-dropdown');
         if (dropdown) dropdown.remove();
         document.removeEventListener('click', closeDropdownOnClickOutside);
 
@@ -368,6 +375,14 @@ function deleteProject(projectId, projectName) {
                 const result = await API.deleteProject(projectId);
                 if (result.success) {
                     showToast('项目已删除', 'success');
+                    // 关闭下拉菜单
+                    if (projectDropdownOpen) {
+                        projectDropdownOpen = false;
+                        document.getElementById('projectSelectorBtn').classList.remove('open');
+                        const dropdown = document.body.querySelector('.project-dropdown');
+                        if (dropdown) dropdown.remove();
+                        document.removeEventListener('click', closeDropdownOnClickOutside);
+                    }
                     await loadProjects();
                 }
             } catch (err) {
@@ -402,7 +417,10 @@ function toggleSettings() {
  */
 async function loadVideoList() {
     try {
-        const data = await API.getVideos();
+        const [data, bgStatus] = await Promise.all([
+            API.getVideos(),
+            API.getBgTaskStatus(),
+        ]);
         const list = document.getElementById('videoList');
 
         if (!data.videos || data.videos.length === 0) {
@@ -412,13 +430,23 @@ async function loadVideoList() {
         }
 
         document.getElementById('clearVideosBtn').classList.remove('hidden');
-        list.innerHTML = data.videos.map(v => `
-            <div class="video-list-item">
-                <span class="video-filename" title="${escapeHtml(v.path)}">${escapeHtml(v.filename)}</span>
-                <span class="video-meta">${formatFileSize(v.size_mb)} · ${v.shot_count} 镜头</span>
-                <span class="video-delete-btn" onclick="deleteVideoItem('${escapeHtml(v.path)}', '${escapeHtml(v.filename)}')">删除</span>
-            </div>
-        `).join('');
+        list.innerHTML = data.videos.map(v => {
+            // 判断当前视频是否正在拆分
+            const isCurrentlySplitting = bgStatus.stage === 'splitting' &&
+                bgStatus.current_video === v.filename;
+            const statusBadge = isCurrentlySplitting
+                ? '<span class="video-status-badge splitting">拆分中</span>'
+                : '';
+
+            return `
+                <div class="video-list-item">
+                    <span class="video-filename" title="${escapeHtml(v.path)}">${escapeHtml(v.filename)}</span>
+                    ${statusBadge}
+                    <span class="video-meta">${formatFileSize(v.size_mb)} · ${v.shot_count} 镜头</span>
+                    <span class="video-delete-btn" onclick="deleteVideoItem('${escapeHtml(v.path)}', '${escapeHtml(v.filename)}')">删除</span>
+                </div>
+            `;
+        }).join('');
     } catch (err) {
         console.error('加载视频列表失败:', err);
     }
@@ -437,6 +465,9 @@ function deleteVideoItem(videoPath, filename) {
                 const result = await API.deleteVideo(videoPath);
                 if (result.success) {
                     showToast('视频已删除', 'success');
+                    // 刷新项目列表数据（更新 shot_count / video_count）
+                    const projData = await API.getProjects();
+                    allProjects = projData.projects || [];
                     loadVideoList();
                     await initProjectView();
                 }
@@ -454,13 +485,20 @@ function deleteVideoItem(videoPath, filename) {
 function clearAllVideos() {
     showConfirm(
         '清空所有视频',
-        '确定要删除当前项目的全部视频、镜头和帧数据吗？此操作不可恢复。',
+        '确定要清空当前项目的全部视频吗？已收藏的镜头会保留。',
         '清空全部',
         async () => {
             try {
                 const result = await API.clearVideos();
                 if (result.success) {
-                    showToast('已清空所有视频', 'success');
+                    let msg = '已清空所有视频';
+                    if (result.favorites_kept > 0) {
+                        msg += `，已保留 ${result.favorites_kept} 个收藏镜头`;
+                    }
+                    showToast(msg, 'success');
+                    // 刷新项目列表数据（更新 shot_count / video_count）
+                    const projData = await API.getProjects();
+                    allProjects = projData.projects || [];
                     loadVideoList();
                     await initProjectView();
                 }
@@ -492,7 +530,7 @@ function onThresholdChange(value) {
 function showReanalyzeBtn() {
     let btn = document.getElementById('reanalyzeBtn');
     if (!btn) {
-        const container = document.querySelector('.toolbar-threshold');
+        const container = document.querySelector('.sidebar-sensitivity');
         if (!container) return;
         btn = document.createElement('button');
         btn.id = 'reanalyzeBtn';
@@ -526,7 +564,7 @@ async function doReanalyze() {
     shotTypeDetected = false;
     faceDetected = false;
 
-    showAnalyzeProgress('正在以新灵敏度重新分析…', 2);
+    showAnalyzeProgress('正在以新灵敏度重新分析…');
     showProgress(30);
 
     try {
@@ -537,7 +575,6 @@ async function doReanalyze() {
         } else if (result.success) {
             totalShots = result.total_shots || 0;
             fps = result.fps || fps;
-            showAnalyzeProgress('重新分析完成！', 5);
             showProgress(100);
 
             let msg = `重新分析完成，检测到 ${result.total_shots} 个镜头`;
@@ -546,6 +583,10 @@ async function doReanalyze() {
             }
             showToast(msg, 'success');
             hideReanalyzeBtn();
+
+            if (result.bg_analyzing) {
+                startBgTaskPolling();
+            }
         } else {
             showToast('重新分析失败', 'error');
         }
@@ -562,4 +603,124 @@ async function doReanalyze() {
     const projData = await API.getProjects();
     allProjects = projData.projects || [];
     await initProjectView();
+}
+
+/* ═══════════════════════════════════════════════════
+   后台分析轮询 — 分阶段感知 + 灰色小字提示 + Toast
+   ═══════════════════════════════════════════════════ */
+
+/**
+ * 启动后台分析状态轮询
+ * 分阶段感知：splitting（镜头拆分）→ analyzing（深度分析）→ done
+ */
+function startBgTaskPolling() {
+    if (bgTaskPolling) return;
+    bgTaskPolling = true;
+
+    let lastSplitDone = 0; // 记录上次已完成拆分数
+    let enteredFromSplitting = false; // 标记是否从拆分阶段开始
+
+    // 显示灰色小字提示
+    updateBgAnalyzingHint(true, '后台分析中');
+
+    bgTaskPollTimer = setInterval(async () => {
+        try {
+            const status = await API.getBgTaskStatus();
+
+            if (status.done || !status.running) {
+                stopBgTaskPolling();
+
+                // 分析完成，刷新数据
+                showToast('所有分析已完成', 'success');
+                updateBgAnalyzingHint(false);
+
+                // 重新加载镜头数据（封面帧可能已更新、标签已就位）
+                await loadShots();
+
+                // 刷新项目列表数据
+                const projData = await API.getProjects();
+                allProjects = projData.projects || [];
+                updateVideoSourceTags();
+                return;
+            }
+
+            // ── 拆分阶段 ──
+            if (status.stage === 'splitting') {
+                enteredFromSplitting = true;
+                const totalVids = status.split_done + status.split_queue;
+                const hint = status.current_video
+                    ? `正在拆分 ${status.current_video}（${status.split_done}/${totalVids}）`
+                    : `拆分中（${status.split_done}/${totalVids}）`;
+                updateBgAnalyzingHint(true, hint);
+
+                // 每完成一个视频的拆分 → 刷新镜头列表（追加显示新镜头）
+                if (status.split_done > lastSplitDone) {
+                    lastSplitDone = status.split_done;
+                    await loadShots();
+                    showToast('新视频拆分完成，已追加镜头', 'success');
+                    // 更新项目列表数据
+                    const projData = await API.getProjects();
+                    allProjects = projData.projects || [];
+                    updateVideoSourceTags();
+                    // 刷新视频管理列表（如果下拉已打开）
+                    if (document.getElementById('videoList')) {
+                        loadVideoList();
+                    }
+                }
+            }
+
+            // ── 深度分析阶段 ──
+            if (status.stage === 'analyzing') {
+                if (enteredFromSplitting) {
+                    // 从拆分阶段过渡过来，Toast 通知一下
+                    enteredFromSplitting = false;
+                    showToast('镜头拆分全部完成，正在深度分析', 'success');
+                }
+                updateBgAnalyzingHint(true, `深度分析中 ${status.progress}%`);
+
+                // 进度过半时刷新一次（拿到部分新标签+新封面）
+                if (status.progress >= 50 && !window._bgStage1Refreshed) {
+                    window._bgStage1Refreshed = true;
+                    await loadShots();
+                }
+            }
+
+        } catch (err) {
+            console.error('轮询后台状态失败:', err);
+        }
+    }, 2000); // 2秒轮询（拆分阶段需要更及时）
+}
+
+/**
+ * 停止后台分析轮询
+ */
+function stopBgTaskPolling() {
+    bgTaskPolling = false;
+    window._bgStage1Refreshed = false;
+    if (bgTaskPollTimer) {
+        clearInterval(bgTaskPollTimer);
+        bgTaskPollTimer = null;
+    }
+}
+
+/**
+ * 更新镜头计数旁的灰色小字提示
+ */
+function updateBgAnalyzingHint(show, text = '分析中') {
+    let hint = document.getElementById('bgAnalyzingHint');
+
+    if (!show) {
+        if (hint) hint.remove();
+        return;
+    }
+
+    if (!hint) {
+        hint = document.createElement('span');
+        hint.id = 'bgAnalyzingHint';
+        hint.className = 'bg-analyzing-hint';
+        const topbarTitle = document.getElementById('topbarTitle');
+        if (topbarTitle) topbarTitle.appendChild(hint);
+    }
+
+    hint.innerHTML = `<span class="bg-analyzing-dot"></span>${text}`;
 }

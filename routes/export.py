@@ -1,5 +1,6 @@
 """导出 API 路由 — 批量导出镜头 MP4"""
 import os
+import shutil
 import asyncio
 from fastapi import APIRouter, HTTPException
 
@@ -7,6 +8,7 @@ from models.schemas import ExportShotsRequest
 from services.project_manager import (
     get_active_project_id,
     load_project_data,
+    get_project_dir,
 )
 
 router = APIRouter()
@@ -42,6 +44,10 @@ async def export_shots(req: ExportShotsRequest):
 
     results = []
 
+    # 获取项目目录（用于查找 clip_file）
+    proj_dir = get_project_dir(pid)
+    shots_dir = os.path.join(proj_dir, "shots")
+
     for shot_id in req.shot_ids:
         shot = shots_map.get(shot_id)
         if not shot:
@@ -49,7 +55,14 @@ async def export_shots(req: ExportShotsRequest):
             continue
 
         video_path = shot.get("source_video")
-        if not video_path or not os.path.exists(video_path):
+        has_source = video_path and os.path.exists(video_path)
+
+        # ★ 如果源视频不存在，尝试使用预裁剪的 clip_file
+        clip_file = shot.get("clip_file", "")
+        clip_path = os.path.join(shots_dir, clip_file) if clip_file else ""
+        has_clip = clip_file and os.path.exists(clip_path)
+
+        if not has_source and not has_clip:
             results.append({"shot_id": shot_id, "error": "源视频文件不存在"})
             continue
 
@@ -67,33 +80,50 @@ async def export_shots(req: ExportShotsRequest):
             counter += 1
 
         try:
-            start_time = shot["start_time"]
-            duration = shot["duration"]
+            if has_source:
+                # 从源视频精确裁剪
+                start_time = shot["start_time"]
+                duration = shot["duration"]
 
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start_time),
-                "-i", video_path,
-                "-t", str(duration),
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                output_path,
-            ]
+                # 精确裁剪：使用双 -ss 策略，避免关键帧偏移导致导出到前后镜头的帧
+                # 第一个 -ss（input seeking）快速跳到目标附近的关键帧
+                # 第二个 -ss（output seeking）精确偏移到目标位置
+                safe_start = max(0, start_time - 5)
+                offset = round(start_time - safe_start, 6)
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(safe_start),
+                    "-i", video_path,
+                    "-ss", str(offset),
+                    "-t", str(duration),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "18",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-avoid_negative_ts", "make_zero",
+                    output_path,
+                ]
 
-            if process.returncode == 0:
-                results.append({"shot_id": shot_id, "path": output_path})
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await process.communicate()
+
+                if process.returncode == 0:
+                    results.append({"shot_id": shot_id, "path": output_path})
+                else:
+                    results.append({
+                        "shot_id": shot_id,
+                        "error": f"FFmpeg 错误: {stderr.decode()[:100]}",
+                    })
             else:
-                results.append({
-                    "shot_id": shot_id,
-                    "error": f"FFmpeg 错误: {stderr.decode()[:100]}",
-                })
+                # ★ 源视频不存在，直接复制预裁剪的 clip 文件
+                shutil.copy2(clip_path, output_path)
+                results.append({"shot_id": shot_id, "path": output_path})
 
         except Exception as e:
             results.append({"shot_id": shot_id, "error": str(e)})

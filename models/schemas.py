@@ -78,3 +78,8 @@ class VideoDeleteRequest(BaseModel):
 
 class ReanalyzeRequest(BaseModel):
     threshold: Optional[int] = None
+
+
+class BatchAnalyzeRequest(BaseModel):
+    video_paths: list[str]
+    threshold: Optional[int] = None

@@ -8,7 +8,7 @@ from typing import Optional, Callable
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector, AdaptiveDetector
 
-from models.constants import DEFAULT_THRESHOLD, JPEG_QUALITY
+from models.constants import DEFAULT_THRESHOLD, JPEG_QUALITY, THUMBNAIL_WIDTH, THUMBNAIL_JPEG_QUALITY, MIN_FACE_RATIO
 
 # 镜头边界安全裁剪帧数（修复卡到相邻镜头的问题）
 BOUNDARY_TRIM_FRAMES = 2
@@ -69,6 +69,7 @@ def detect_scenes(video_path: str, threshold: Optional[int] = None) -> tuple:
     min_cv = max(10.0, threshold * 0.5)
 
     scene_manager = SceneManager()
+    scene_manager.downscale = 3  # 降采样加速场景检测
     scene_manager.add_detector(AdaptiveDetector(
         adaptive_threshold=adaptive_th,
         min_scene_len=15,
@@ -353,3 +354,195 @@ def build_shots_from_scenes(
         cap.release()
 
     return shots
+
+
+def save_thumbnail(frame: np.ndarray, output_path: str):
+    """将帧缩放到缩略图尺寸后保存为 JPEG"""
+    h, w = frame.shape[:2]
+    if w > THUMBNAIL_WIDTH:
+        scale = THUMBNAIL_WIDTH / w
+        frame = cv2.resize(frame, (THUMBNAIL_WIDTH, int(h * scale)))
+    cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, THUMBNAIL_JPEG_QUALITY])
+
+
+def build_shots_fast(
+    scenes: list,
+    fps: float,
+    video_path: str,
+    frames_dir: str,
+    index_offset: int = 0,
+    cancel_check: Callable[[], bool] = None,
+) -> list:
+    """
+    快速构建 Shot 数据 — 只做镜头拆分 + 提取首帧缩略图。
+    跳过动态值计算和人脸检测，让用户快速进入主页面。
+
+    Args:
+        scenes: [(start_frame, end_frame), ...]
+        fps: 视频帧率
+        video_path: 视频文件路径
+        frames_dir: 帧输出目录
+        index_offset: 全局序号偏移
+        cancel_check: 取消检查回调
+
+    Returns:
+        Shot 字典列表
+    """
+    os.makedirs(frames_dir, exist_ok=True)
+    video_hash = _video_hash(video_path)
+    shots = []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return shots
+
+    # 收集所有首帧帧号并排序，减少随机 seek
+    indexed_scenes = list(enumerate(scenes))
+    sorted_scenes = sorted(indexed_scenes, key=lambda x: x[1][0])
+
+    # 先按排序顺序提取帧
+    frame_data = {}  # orig_idx -> (frame_file, frame_path)
+
+    try:
+        for orig_idx, (start_frame, end_frame) in sorted_scenes:
+            if cancel_check and orig_idx % 5 == 0 and cancel_check():
+                break
+
+            idx = orig_idx + index_offset
+            timecode = _frame_to_timecode(start_frame, fps)
+            shot_id = f"shot_{idx:04d}_{video_hash}_{timecode}"
+            frame_file = f"{shot_id}.jpg"
+            frame_path = os.path.join(frames_dir, frame_file)
+
+            # 提取首帧并保存为缩略图
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                save_thumbnail(frame, frame_path)
+
+            frame_data[orig_idx] = frame_file
+
+        # 按原始顺序构建 shot 列表
+        for i, (start_frame, end_frame) in enumerate(scenes):
+            if cancel_check and cancel_check():
+                break
+
+            idx = i + index_offset
+            mid_frame = (start_frame + end_frame) // 2
+            timecode = _frame_to_timecode(start_frame, fps)
+            timecode_display = _frame_to_display_timecode(start_frame, fps)
+
+            shot_id = f"shot_{idx:04d}_{video_hash}_{timecode}"
+            frame_file = frame_data.get(i, f"{shot_id}.jpg")
+
+            start_time = round(start_frame / fps, 3)
+            end_time = round(end_frame / fps, 3)
+            duration = round(end_time - start_time, 3)
+
+            shot = {
+                "id": shot_id,
+                "index": idx,
+                "timecode": timecode,
+                "timecode_display": timecode_display,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "mid_frame": mid_frame,
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration": duration,
+                "has_person": False,
+                "face_ratio": 0.0,
+                "face_count": 0,
+                "person_ratio": 0.0,
+                "good_composition": False,
+                "motion_score": 0.0,
+                "shot_type": "",
+                "face_detected": False,
+                "shot_type_detected": False,
+                "favorite": False,
+                "saved": False,
+                "frame_file": frame_file,
+                "source_video": os.path.abspath(video_path),
+            }
+            shots.append(shot)
+    finally:
+        cap.release()
+
+    return shots
+
+
+def select_representative_frame(
+    cap, start_frame: int, end_frame: int, shot_label: str, face_info_by_pos: dict
+) -> tuple:
+    """
+    根据镜头分类结果，选择最能代表该镜头的帧。
+
+    Args:
+        cap: VideoCapture
+        start_frame / end_frame: 帧范围
+        shot_label: "近景人像" | "黄金人像" | "远景人像" | "空镜"
+        face_info_by_pos: {frame_num: {face_ratio, person_ratio, face_count}} 各采样帧的检测结果
+
+    Returns:
+        (frame_num, frame_image) 最佳代表帧的帧号和图像
+    """
+    if shot_label in ("近景人像", "黄金人像", "远景人像") and face_info_by_pos:
+        # 选人脸/人体占比最大的帧
+        best_fn = max(
+            face_info_by_pos.keys(),
+            key=lambda fn: (
+                face_info_by_pos[fn].get("person_ratio", 0) +
+                face_info_by_pos[fn].get("face_ratio", 0)
+            )
+        )
+        cap.set(cv2.CAP_PROP_POS_FRAMES, best_fn)
+        ret, frame = cap.read()
+        if ret:
+            return best_fn, frame
+
+    # 空镜或回退：取中间帧（比首帧更有代表性）
+    mid = (start_frame + end_frame) // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, mid)
+    ret, frame = cap.read()
+    if ret:
+        return mid, frame
+
+    return start_frame, None
+
+
+def _calc_motion_score_fast(cap, start_frame: int, end_frame: int) -> float:
+    """
+    快速动态值 — 3帧灰度帧差（替代光流法），速度提升 5-8 倍。
+
+    Args:
+        cap: 已打开的 VideoCapture
+        start_frame: 起始帧号
+        end_frame: 结束帧号
+
+    Returns:
+        动态值 0.0 ~ 100.0
+    """
+    frame_count = end_frame - start_frame
+    if frame_count < 2:
+        return 0.0
+
+    # 只采样 3 个位置：25%, 50%, 75%
+    positions = [0.25, 0.50, 0.75]
+    grays = []
+    for p in positions:
+        fn = start_frame + int(frame_count * p)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            h, w = frame.shape[:2]
+            if w > 160:
+                scale = 160 / w
+                frame = cv2.resize(frame, (160, int(h * scale)))
+            grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+
+    if len(grays) < 2:
+        return 0.0
+
+    diffs = [np.abs(grays[i] - grays[i + 1]).mean() for i in range(len(grays) - 1)]
+    score = min(100.0, (np.mean(diffs) / 25.0) * 100.0)
+    return round(float(score), 1)

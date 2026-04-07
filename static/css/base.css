@@ -5,15 +5,15 @@
 /* ── 设计令牌 ── */
 :root {
   /* 背景层级（由深到浅） */
-  --bg-primary:    #000000;
-  --bg-secondary:  #1c1c1e;
-  --bg-tertiary:   #2c2c2e;
-  --bg-elevated:   #3a3a3c;
+  --bg-primary:    #0a0a0a;
+  --bg-secondary:  #141416;
+  --bg-tertiary:   #1e1e22;
+  --bg-elevated:   #2a2a2e;
 
   /* 文字 */
-  --text-primary:   #f5f5f7;
-  --text-secondary: #a1a1a6;
-  --text-tertiary:  #636366;
+  --text-primary:   #e8e8eb;
+  --text-secondary: #8e8e93;
+  --text-tertiary:  #555558;
 
   /* 强调色 */
   --accent:         #0a84ff;
@@ -22,8 +22,12 @@
   --orange:         #ff9f0a;
   --red:            #ff453a;
 
+  /* 导入按钮色（橙红） */
+  --import-btn:     #d95a3e;
+  --import-btn-hover: #e06b50;
+
   /* 分割线 */
-  --separator: rgba(84, 84, 88, 0.65);
+  --separator: rgba(60, 60, 64, 0.5);
 
   /* 字体 */
   --font-sans:    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
@@ -281,6 +285,41 @@ input::placeholder, textarea::placeholder {
   background: var(--bg-elevated);
   color: var(--text-primary);
   box-shadow: var(--shadow-sm);
+}
+
+/* ── 扁平标签组（景别筛选用） ── */
+.flat-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+.flat-tags .seg-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 4px;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all 150ms ease-out;
+  user-select: none;
+  background: none;
+  white-space: nowrap;
+}
+.flat-tags .seg-item:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.04);
+}
+.flat-tags .seg-item.active {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
 }
 
 /* ── Toast 通知 ── */

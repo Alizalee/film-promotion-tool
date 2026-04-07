@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>影视剧宣发拉片工具</title>
+    <title>Nice Cut — 影视剧宣发拉片工具</title>
     <link rel="stylesheet" href="/static/css/base.css">
     <link rel="stylesheet" href="/static/css/layout.css">
     <link rel="stylesheet" href="/static/css/components.css">
@@ -14,12 +14,18 @@
     <!-- 顶部进度条 -->
     <div id="topProgressBar" class="progress-bar-top hidden" style="width:0%"></div>
 
-    <!-- 顶部栏 -->
-    <header class="header">
-        <div class="header-left">
-            <span class="header-logo">拉片工具</span>
+    <!-- 左侧边栏 -->
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <span class="sidebar-logo">Nice Cut</span>
+            <div class="sidebar-toggle" id="sidebarCollapseBtn" onclick="toggleSidebar()" title="收起侧边栏">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="2" y1="4" x2="14" y2="4"/><line x1="2" y1="8" x2="14" y2="8"/><line x1="2" y1="12" x2="14" y2="12"/></svg>
+            </div>
         </div>
-        <div class="header-center">
+
+        <!-- 项目选择器（下拉切换） -->
+        <div class="sidebar-section">
+            <div class="sidebar-section-title">项目</div>
             <div class="project-selector" id="projectSelector">
                 <div class="project-selector-btn" id="projectSelectorBtn" onclick="toggleProjectDropdown()">
                     <span class="proj-name" id="currentProjectName">未选择项目</span>
@@ -27,46 +33,95 @@
                 </div>
             </div>
         </div>
-        <div class="header-right">
-            <!-- 设置已合并到项目下拉中 -->
-        </div>
-    </header>
 
-    <!-- 工具栏（有镜头时显示） -->
-    <div class="toolbar hidden" id="toolbar">
-        <div class="toolbar-left">
-            <div class="segmented-control" id="sortControl">
-                <div class="seg-item active" data-sort="time" onclick="setSort('time')">时间顺序</div>
-                <div class="seg-item" data-sort="motion" onclick="setSort('motion')">动态差异</div>
+        <!-- 导入视频按钮（独立蓝色按钮，项目选择器下方） -->
+        <div class="sidebar-import-action">
+            <button class="btn-import-video" onclick="triggerFileSelect()" title="选择视频文件">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="7" y1="2" x2="7" y2="12"/><line x1="2" y1="7" x2="12" y2="7"/></svg>
+                导入视频
+            </button>
+            <input type="file" id="fileInput" accept="video/*" multiple style="display:none" onchange="handleFileSelect(event)">
+        </div>
+
+        <div class="sidebar-divider"></div>
+
+        <!-- 筛选：全部镜头 / 已收藏 -->
+        <div class="sidebar-section">
+            <div class="sidebar-section-title">筛选</div>
+            <div class="sidebar-item active" id="filterAll" onclick="setFavoriteFilter(false)">
+                <span class="sidebar-icon">🎞</span>
+                <span class="sidebar-label">全部镜头</span>
+                <span class="sidebar-badge" id="sidebarShotCount">0</span>
+            </div>
+            <div class="sidebar-item" id="filterFavorite" onclick="setFavoriteFilter(true)">
+                <span class="sidebar-icon" style="color:var(--orange)">♥</span>
+                <span class="sidebar-label">已收藏</span>
+                <span class="sidebar-badge" id="sidebarFavCount">0</span>
             </div>
         </div>
-        <div class="toolbar-center" id="filterTags">
-            <div class="segmented-control" id="shotTypeControl">
-                <div class="seg-item active" data-type="" onclick="setShotTypeFilter('')">全部</div>
-                <div class="seg-item" data-type="近景" onclick="setShotTypeFilter('近景')">近景</div>
-                <div class="seg-item" data-type="远景" onclick="setShotTypeFilter('远景')">远景</div>
-            </div>
-            <div class="filter-divider"></div>
-            <div class="tag" id="filterFavorite" onclick="toggleFavoriteFilter()">已收藏</div>
-            <select class="video-source-select" id="videoSourceSelect" onchange="onVideoSourceChange(this.value)">
-                <option value="">全部视频</option>
-            </select>
-            <div class="filter-divider"></div>
-            <div class="toolbar-threshold">
-                <span class="toolbar-threshold-label">镜头切分灵敏度</span>
-                <input type="range" class="toolbar-threshold-slider" id="thresholdSlider" min="10" max="60" value="27" oninput="onThresholdChange(this.value)">
-                <span class="toolbar-threshold-value" id="thresholdValue">27</span>
+
+        <div class="sidebar-divider"></div>
+
+        <!-- 视频源多选列表 -->
+        <div class="sidebar-section sidebar-section-scroll" id="videoSourceSection">
+            <div class="sidebar-section-title">视频源</div>
+            <div id="videoSourceList">
+                <!-- 动态渲染 checkbox 列表 -->
             </div>
         </div>
-        <div class="toolbar-right">
-            <span class="shot-count" id="shotCount"></span>
-            <button class="btn-text" id="selectModeBtn" onclick="toggleSelectMode()">选择</button>
+
+        <!-- 底部：仅灵敏度滑块 -->
+        <div class="sidebar-bottom">
+            <div class="sidebar-sensitivity">
+                <label>镜头切分灵敏度</label>
+                <div class="sidebar-slider-row">
+                    <input type="range" id="thresholdSlider" min="10" max="60" value="27" oninput="onThresholdChange(this.value)">
+                    <span class="sidebar-slider-val" id="thresholdValue">27</span>
+                </div>
+            </div>
         </div>
     </div>
 
-    <!-- 内容区 -->
-    <div class="content-area" id="contentArea">
-        <!-- 动态内容由 JS 渲染 -->
+    <!-- 右侧主区域 -->
+    <div class="main" id="mainArea">
+        <!-- 顶栏：项目名 -->
+        <div class="topbar" id="topbar">
+            <div class="topbar-toggle" id="sidebarExpandBtn" onclick="toggleSidebar()" title="展开侧边栏">
+                <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="2" y1="4" x2="14" y2="4"/><line x1="2" y1="8" x2="14" y2="8"/><line x1="2" y1="12" x2="14" y2="12"/></svg>
+            </div>
+            <span class="topbar-title" id="topbarTitle">
+                <span id="topbarProjectName">未选择项目</span>
+            </span>
+        </div>
+        <!-- 筛选栏：左侧景别+排序，右侧视图大小 -->
+        <div class="filter-bar" id="filterBar">
+            <div class="filter-bar-left">
+                <div class="filter-group" id="shotTypeControl">
+                    <div class="filter-chip active" data-type="" onclick="setShotTypeFilter('')">全部 <span class="seg-count" id="countAll"></span></div>
+                    <div class="filter-chip" data-type="近景人像" onclick="setShotTypeFilter('近景人像')">近景人像 <span class="seg-count" id="countCloseUp"></span></div>
+                    <div class="filter-chip" data-type="黄金人像" onclick="setShotTypeFilter('黄金人像')">黄金人像 <span class="seg-count" id="countGolden"></span></div>
+                    <div class="filter-chip" data-type="远景人像" onclick="setShotTypeFilter('远景人像')">远景人像 <span class="seg-count" id="countWidePortrait"></span></div>
+                    <div class="filter-chip" data-type="空镜" onclick="setShotTypeFilter('空镜')">空镜 <span class="seg-count" id="countEmpty"></span></div>
+                </div>
+                <div class="filter-divider-v"></div>
+                <div class="filter-group" id="sortControl">
+                    <div class="filter-chip active" data-sort="time" onclick="setSort('time')">时间顺序</div>
+                    <div class="filter-chip" data-sort="motion" onclick="setSort('motion')">动态差异</div>
+                </div>
+            </div>
+            <div class="filter-bar-right">
+                <div class="filter-group grid-size-group" id="gridSizeControl" title="视图大小">
+                    <div class="filter-chip" data-size="sm" onclick="setGridSize('sm')">小</div>
+                    <div class="filter-chip active" data-size="md" onclick="setGridSize('md')">中</div>
+                    <div class="filter-chip" data-size="lg" onclick="setGridSize('lg')">大</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 内容区 -->
+        <div class="content-area" id="contentArea">
+            <!-- 动态内容由 JS 渲染 -->
+        </div>
     </div>
 
     <!-- 底部选中操作栏 -->
