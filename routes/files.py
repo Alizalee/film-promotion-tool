@@ -32,7 +32,11 @@ async def get_frame(filename: str):
     if not os.path.exists(frame_path):
         raise HTTPException(status_code=404, detail="帧文件不存在")
 
-    return FileResponse(frame_path, media_type="image/jpeg")
+    return FileResponse(
+        frame_path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @router.get("/saved_frames/{filename}")
@@ -45,7 +49,11 @@ async def get_saved_frame(filename: str):
     if not os.path.exists(frame_path):
         raise HTTPException(status_code=404, detail="帧文件不存在")
 
-    return FileResponse(frame_path, media_type="image/jpeg")
+    return FileResponse(
+        frame_path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @router.get("/video")

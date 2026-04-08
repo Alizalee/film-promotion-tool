@@ -989,16 +989,19 @@
   color: #fff;
 }
 
-/* ── 后台分析提示（镜头计数旁灰色小字） ── */
+/* ── 后台分析提示（蓝色胶囊样式 — 更醒目） ── */
 .bg-analyzing-hint {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  margin-left: 8px;
+  gap: 6px;
+  margin-left: 10px;
   font-size: 11px;
-  color: var(--text-tertiary);
-  font-weight: var(--weight-medium);
+  color: var(--accent);
+  font-weight: 600;
   letter-spacing: 0.2px;
+  background: rgba(10, 132, 255, 0.12);
+  padding: 3px 10px;
+  border-radius: 999px;
 }
 
 .bg-analyzing-dot {

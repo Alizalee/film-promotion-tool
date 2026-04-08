@@ -251,6 +251,19 @@ const API = {
         return res.json();
     },
 
+    async getAnalysisCompleteness() {
+        const res = await fetch('/api/analysis_completeness');
+        return res.json();
+    },
+
+    async resumeAnalysis() {
+        const res = await fetch('/api/resume_analysis', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+        return res.json();
+    },
+
     // ── 收藏镜头 clip 补偿 ──
     async ensureFavoriteClips() {
         const res = await fetch('/api/ensure_favorite_clips', {

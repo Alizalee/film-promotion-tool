@@ -24,18 +24,39 @@ async function loadShots() {
 
         allShots = shots;
         totalShots = data.total || 0;
-        totalAllShots = data.total_all || data.total || 0;
         totalFavorites = data.favorite_count || 0;
 
-        // ★ 当有视频源筛选时，需要基于选中视频源重新计算各项计数
+        // ★ total_all: 后端基于筛选条件（除景别外）的基准总数 → 用于右侧分类标签"全部"
+        // ★ total_all_global: 后端全量总数（不受任何筛选影响）→ 用于侧边栏"全部镜头"
+        let filteredTotalAll = data.total_all || data.total || 0;
+        totalAllShots = data.total_all_global || data.total_all || data.total || 0;
         let filteredShotTypeCounts = data.shot_type_counts || {};
+
+        // ★ 当有视频源筛选时，需要基于选中视频源重新计算各项计数
         if (sourceVideoFilters.size > 0) {
+            // ★ 侧边栏"全部镜头"始终显示已勾选视频源的总镜头数（不受收藏/搜索/景别筛选影响）
+            // 当有收藏/搜索筛选时，需要额外请求全量数据；否则可复用当前数据
+            let globalFiltered;
+            if (favoriteOnly || searchQuery) {
+                const globalData = await API.getShots({ sort: currentSort });
+                globalFiltered = (globalData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
+            } else if (!shotTypeFilter) {
+                // 无任何筛选 → 当前 data.shots 就是全量数据，直接复用
+                globalFiltered = (data.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
+            } else {
+                // 仅有景别筛选 → 后端 total_all_global 是全量，但需前端按视频源过滤
+                // data.shots 受景别筛选影响不完整，需要额外请求
+                const globalData = await API.getShots({ sort: currentSort });
+                globalFiltered = (globalData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
+            }
+            totalAllShots = globalFiltered.length;
+            totalFavorites = globalFiltered.filter(s => s.favorite).length;
+
             if (!shotTypeFilter) {
                 // 没有景别筛选 → 当前请求的 shots 就是全量（仅受收藏/搜索筛选）
                 // 前端过滤后直接统计
                 const allFiltered = (data.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-                totalAllShots = allFiltered.length;
-                totalFavorites = allFiltered.filter(s => s.favorite).length;
+                filteredTotalAll = allFiltered.length;
                 filteredShotTypeCounts = {};
                 for (const s of allFiltered) {
                     const st = s.shot_type || '';
@@ -44,14 +65,13 @@ async function loadShots() {
                     }
                 }
             } else {
-                // 有景别筛选 → 需要额外请求不带景别筛选的全量数据
+                // 有景别筛选 → 需要额外请求不带景别筛选的全量数据来统计各分类计数
                 const allParams = { sort: currentSort };
                 if (favoriteOnly) allParams.favorite_only = true;
                 if (searchQuery) allParams.search = searchQuery;
                 const allData = await API.getShots(allParams);
                 const allFiltered = (allData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-                totalAllShots = allFiltered.length;
-                totalFavorites = allFiltered.filter(s => s.favorite).length;
+                filteredTotalAll = allFiltered.length;
                 filteredShotTypeCounts = {};
                 for (const s of allFiltered) {
                     const st = s.shot_type || '';
@@ -65,7 +85,19 @@ async function loadShots() {
         renderGrid();
         updateShotCount();
         updateSidebarCounts();
-        updateShotTypeCounts(filteredShotTypeCounts);
+        updateShotTypeCounts(filteredShotTypeCounts, filteredTotalAll);
+
+        // ★ 排序/分类数据就绪检查 — 给准确提示
+        if (currentSort === 'motion' && !bgTaskPolling) {
+            if (data.motion_data_ready === false) {
+                showToast('动态值尚未计算，请等待分析完成后再排序', 'error');
+            } else {
+                showToast('按动态差异排序');
+            }
+        }
+        if (shotTypeFilter && data.shot_type_data_ready === false && !bgTaskPolling) {
+            showToast('部分镜头分类尚未完成，筛选结果可能不完整', 'error');
+        }
 
         // ★ 检查是否有收藏镜头缺少 clip_file（需要补偿裁剪）
         const needsClip = allShots.some(s => s.favorite && !s.clip_file);
@@ -347,11 +379,14 @@ function updateSidebarCounts() {
 
 /**
  * 更新景别筛选标签上的计数
+ * @param counts - 各分类的计数对象
+ * @param filteredTotal - 当前筛选上下文下的基准总数（用于"全部"标签）
  */
-function updateShotTypeCounts(counts) {
-    // "全部" 标签显示总数
+function updateShotTypeCounts(counts, filteredTotal) {
+    // "全部" 标签显示当前筛选上下文的总数（如收藏模式下只显示收藏的镜头总数）
+    const displayTotal = filteredTotal !== undefined ? filteredTotal : totalAllShots;
     const countAll = document.getElementById('countAll');
-    if (countAll) countAll.textContent = totalAllShots > 0 ? totalAllShots : '';
+    if (countAll) countAll.textContent = displayTotal > 0 ? displayTotal : '';
 
     // 各分类计数
     const mapping = {
@@ -377,7 +412,16 @@ function setSort(sort) {
     document.querySelectorAll('#sortControl .filter-chip').forEach(el => {
         el.classList.toggle('active', el.dataset.sort === sort);
     });
-    showToast(sort === 'motion' ? '按动态差异排序' : '按时间顺序排序');
+
+    if (sort === 'motion' && bgTaskPolling) {
+        // 后台分析进行中，动态值尚未就绪
+        showToast('镜头分析中，完成后自动生效', 'info');
+    } else if (sort === 'motion') {
+        // 分析完成，但检查数据是否真的有效（延迟到 loadShots 回调）
+        // toast 先不显示，在 loadShots 中根据 motion_data_ready 判断
+    } else {
+        showToast('按时间顺序排序');
+    }
     loadShots();
 }
 
@@ -409,6 +453,17 @@ function toggleFavoriteFilter() {
 async function setShotTypeFilter(type) {
     // 首次选择非"全部"时触发分类分析
     if (type && !shotTypeDetected) {
+        // ★ 后台分析进行中 → 不触发同步 detectShotTypes，给提示
+        if (bgTaskPolling) {
+            showToast('镜头分析中，完成后自动生效', 'info');
+            shotTypeFilter = type || null;
+            document.querySelectorAll('#shotTypeControl .filter-chip').forEach(el => {
+                el.classList.toggle('active', el.dataset.type === (shotTypeFilter || ''));
+            });
+            loadShots();
+            return;
+        }
+
         shotTypeDetecting = true;
         showToast('正在分析镜头分类，首次需要几秒钟…');
 

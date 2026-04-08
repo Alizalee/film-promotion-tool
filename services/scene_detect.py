@@ -512,7 +512,8 @@ def select_representative_frame(
 
 def _calc_motion_score_fast(cap, start_frame: int, end_frame: int) -> float:
     """
-    快速动态值 — 3帧灰度帧差（替代光流法），速度提升 5-8 倍。
+    快速动态值 — 3帧 Lab 彩色帧差（替代光流法），速度提升 5-8 倍。
+    使用 Lab 色彩空间替代灰度，能更好捕捉特效光影、色彩变化等人眼可感知的动态。
 
     Args:
         cap: 已打开的 VideoCapture
@@ -528,7 +529,7 @@ def _calc_motion_score_fast(cap, start_frame: int, end_frame: int) -> float:
 
     # 只采样 3 个位置：25%, 50%, 75%
     positions = [0.25, 0.50, 0.75]
-    grays = []
+    labs = []
     for p in positions:
         fn = start_frame + int(frame_count * p)
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
@@ -538,11 +539,12 @@ def _calc_motion_score_fast(cap, start_frame: int, end_frame: int) -> float:
             if w > 160:
                 scale = 160 / w
                 frame = cv2.resize(frame, (160, int(h * scale)))
-            grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+            # Lab 色彩空间：L(亮度) a(绿→红) b(蓝→黄)，更贴近人眼感知
+            labs.append(cv2.cvtColor(frame, cv2.COLOR_BGR2Lab).astype(np.float32))
 
-    if len(grays) < 2:
+    if len(labs) < 2:
         return 0.0
 
-    diffs = [np.abs(grays[i] - grays[i + 1]).mean() for i in range(len(grays) - 1)]
+    diffs = [np.abs(labs[i] - labs[i + 1]).mean() for i in range(len(labs) - 1)]
     score = min(100.0, (np.mean(diffs) / 25.0) * 100.0)
     return round(float(score), 1)

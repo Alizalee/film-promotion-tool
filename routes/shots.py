@@ -91,14 +91,28 @@ async def get_shots(
             s.get("start_frame", 0)
         ))
 
-    # 收藏总数 & 全量总数：基于全量数据（不受任何筛选条件影响）
+    # ★ 全量数据（不受任何筛选影响）— 供侧边栏使用
     all_shots = project_data.get("shots", [])
-    total_all = len(all_shots)
+    total_all_global = len(all_shots)
     favorite_count = sum(1 for s in all_shots if s.get("favorite"))
 
-    # 各景别分类计数（基于全量数据，不受筛选影响）
+    # ★ 分类计数的基准集：应用除景别筛选外的其他筛选条件
+    # 这样当用户选"已收藏"时，分类标签的计数只反映收藏镜头中各分类的数量
+    base_shots = list(all_shots)
+    if has_person:
+        base_shots = [s for s in base_shots if s.get("has_person")]
+    if favorite_only:
+        base_shots = [s for s in base_shots if s.get("favorite")]
+    if source_video:
+        base_shots = [s for s in base_shots if s.get("source_video") == source_video]
+    if search:
+        base_shots = [s for s in base_shots if search in s.get("timecode_display", "") or search in s.get("timecode", "")]
+
+    total_all = len(base_shots)
+
+    # 各景别分类计数（基于筛选后的基准集，不受景别筛选影响）
     shot_type_counts = {}
-    for s in all_shots:
+    for s in base_shots:
         st = s.get("shot_type", "")
         if st:
             shot_type_counts[st] = shot_type_counts.get(st, 0) + 1
@@ -108,12 +122,19 @@ async def get_shots(
         vp = s.get("source_video", "")
         s["source_video_exists"] = bool(vp and os.path.exists(vp))
 
+    # ★ 数据就绪标记 — 前端据此在分析未完成时给出准确提示
+    motion_data_ready = any(s.get("motion_score", 0) > 0 for s in all_shots) if len(all_shots) > 0 else True
+    shot_type_data_ready = all(s.get("shot_type_detected", False) for s in all_shots) if len(all_shots) > 0 else True
+
     return {
         "shots": shots,
         "total": len(shots),
         "total_all": total_all,
+        "total_all_global": total_all_global,
         "favorite_count": favorite_count,
         "shot_type_counts": shot_type_counts,
+        "motion_data_ready": motion_data_ready,
+        "shot_type_data_ready": shot_type_data_ready,
     }
 
 

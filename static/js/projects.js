@@ -98,6 +98,30 @@ async function initProjectView() {
             showEmptyProjectView();
             updateVideoSourceTags();
         }
+
+        // ★ 刷新后自动恢复后台分析轮询（解决刷新页面卡住的问题）
+        try {
+            const bgStatus = await API.getBgTaskStatus();
+            if (bgStatus.running && !bgStatus.done) {
+                console.log('检测到后台分析任务仍在运行，恢复轮询', bgStatus);
+                startBgTaskPolling();
+            } else {
+                // ★ 后台没有在运行 → 检查是否有未完成的分析 → 自动续传
+                try {
+                    const completeness = await API.getAnalysisCompleteness();
+                    if (!completeness.complete && completeness.pending > 0) {
+                        console.log(`检测到 ${completeness.pending} 个镜头未分析，自动恢复分析`);
+                        await API.resumeAnalysis();
+                        startBgTaskPolling();
+                    }
+                } catch (e) {
+                    console.warn('检查分析完成度失败:', e);
+                }
+            }
+        } catch (e) {
+            console.warn('检查后台分析状态失败:', e);
+        }
+
     } catch (err) {
         console.error('加载项目信息失败:', err);
         showEmptyProjectView();
@@ -631,7 +655,7 @@ function startBgTaskPolling() {
                 stopBgTaskPolling();
 
                 // 分析完成，刷新数据
-                showToast('所有分析已完成', 'success');
+                showToast('镜头分析完成', 'success');
                 updateBgAnalyzingHint(false);
 
                 // 重新加载镜头数据（封面帧可能已更新、标签已就位）
@@ -674,9 +698,14 @@ function startBgTaskPolling() {
                 if (enteredFromSplitting) {
                     // 从拆分阶段过渡过来，Toast 通知一下
                     enteredFromSplitting = false;
-                    showToast('镜头拆分全部完成，正在深度分析', 'success');
+                    showToast('镜头拆分全部完成，正在分析镜头', 'success');
                 }
-                updateBgAnalyzingHint(true, `深度分析中 ${status.progress}%`);
+                const analyzed = status.analyzed_count || 0;
+                const total = status.total_count || 0;
+                const hintText = total > 0
+                    ? `镜头分析中 ${analyzed}/${total}（人像 · 景别 · 动态）`
+                    : `镜头分析中 ${status.progress}%（人像 · 景别 · 动态）`;
+                updateBgAnalyzingHint(true, hintText);
 
                 // 进度过半时刷新一次（拿到部分新标签+新封面）
                 if (status.progress >= 50 && !window._bgStage1Refreshed) {

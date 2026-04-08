@@ -1,6 +1,7 @@
 """视频上传、分析与管理 API 路由 — 快速返回 + 后台异步分析"""
 import os
 import cv2
+import time
 import shutil
 import logging
 import threading
@@ -54,6 +55,8 @@ _bg_task_status = {
     "current_video": "",   # 当前正在拆分的视频文件名
     "split_queue": 0,      # 拆分队列剩余数
     "split_done": 0,       # 已完成拆分的视频数
+    "analyzed_count": 0,   # 已分析完成的镜头数
+    "total_count": 0,      # 镜头总数
 }
 _bg_task_lock = threading.Lock()
 _bg_task_thread: threading.Thread | None = None  # 当前后台线程引用
@@ -98,7 +101,8 @@ def _validate_video_path(video_path: str):
 
 
 def _update_bg_status(stage: str, progress: int = 0, running: bool = True, project_id: str = None,
-                      current_video: str = None, split_queue: int = None, split_done: int = None):
+                      current_video: str = None, split_queue: int = None, split_done: int = None,
+                      analyzed_count: int = None, total_count: int = None):
     """线程安全地更新后台任务状态"""
     with _bg_task_lock:
         _bg_task_status["stage"] = stage
@@ -112,12 +116,16 @@ def _update_bg_status(stage: str, progress: int = 0, running: bool = True, proje
             _bg_task_status["split_queue"] = split_queue
         if split_done is not None:
             _bg_task_status["split_done"] = split_done
+        if analyzed_count is not None:
+            _bg_task_status["analyzed_count"] = analyzed_count
+        if total_count is not None:
+            _bg_task_status["total_count"] = total_count
 
 
 def _read_sample_frames(cap, start_frame: int, end_frame: int) -> dict:
     """
     读取镜头的采样帧（25%, 50%, 75%），统一复用于预筛、深度分析和动态值计算。
-    短镜头（<10帧）只采中间帧。
+    短镜头（<10帧）采两端帧（25%, 75%），极短镜头（<3帧）只采中间帧。
 
     Returns:
         {frame_num: BGR_image, ...}
@@ -127,8 +135,10 @@ def _read_sample_frames(cap, start_frame: int, end_frame: int) -> dict:
         return {}
 
     positions = [0.25, 0.50, 0.75]
-    if frame_count < 10:
+    if frame_count < 3:
         positions = [0.50]
+    elif frame_count < 10:
+        positions = [0.25, 0.75]
 
     frames = {}
     for p in positions:
@@ -146,7 +156,8 @@ def _read_sample_frames(cap, start_frame: int, end_frame: int) -> dict:
 
 def _calc_motion_from_frames(frames: dict) -> float:
     """
-    从已读帧计算动态值（灰度帧差法），复用采样帧，避免重复读取。
+    从已读帧计算动态值（Lab 彩色帧差法），复用采样帧，避免重复读取。
+    相比灰度帧差法，Lab 色彩空间能更好地捕捉特效光影、色彩变化等人眼可感知的动态。
 
     Args:
         frames: {frame_num: BGR_image, ...}
@@ -159,7 +170,7 @@ def _calc_motion_from_frames(frames: dict) -> float:
 
     # 按帧号排序
     sorted_fns = sorted(frames.keys())
-    grays = []
+    labs = []
     for fn in sorted_fns:
         frame = frames[fn]
         if frame is None:
@@ -170,36 +181,54 @@ def _calc_motion_from_frames(frames: dict) -> float:
             small = cv2.resize(frame, (160, int(h * scale)))
         else:
             small = frame
-        grays.append(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        # Lab 色彩空间：L(亮度) a(绿→红) b(蓝→黄)，更贴近人眼感知
+        labs.append(cv2.cvtColor(small, cv2.COLOR_BGR2Lab).astype(np.float32))
 
-    if len(grays) < 2:
+    if len(labs) < 2:
         return 0.0
 
-    diffs = [np.abs(grays[i] - grays[i + 1]).mean() for i in range(len(grays) - 1)]
+    diffs = [np.abs(labs[i] - labs[i + 1]).mean() for i in range(len(labs) - 1)]
     score = min(100.0, (np.mean(diffs) / 25.0) * 100.0)
     return round(float(score), 1)
 
 
 def _background_analysis(project_id: str, video_paths: list):
     """
-    后台分析任务 — 单遍扫描：
+    后台分析任务 — 单遍扫描（支持断点续传）：
     每个镜头只读一次帧（25%, 50%, 75%），同时完成：
       ① 快速预筛（YuNet 人脸 + HOG 人体兜底）
       ② 深度人像检测 + 人数统计 + 景别分类 + 智能选帧
       ③ 动态值计算（灰度帧差）
+    断点续传：跳过已完成分析的镜头（face_detected=True），避免重复计算。
+    取消时保存：被取消时保存已完成的中间结果到磁盘。
     """
     try:
-        _update_bg_status("analyzing", 0, True, project_id)
-
         project_data = load_project_data(project_id)
         if not project_data:
-            _update_bg_status("done", 100, False, project_id)
+            _update_bg_status("done", 100, False, project_id,
+                              analyzed_count=0, total_count=0)
             return
 
         shots = project_data.get("shots", [])
         if not shots:
-            _update_bg_status("done", 100, False, project_id)
+            _update_bg_status("done", 100, False, project_id,
+                              analyzed_count=0, total_count=0)
             return
+
+        total_shots = len(shots)
+
+        # ★ 断点续传：统计已完成的镜头数
+        already_done = sum(1 for s in shots if s.get("face_detected", False))
+
+        if already_done >= total_shots:
+            # 所有镜头都已分析完成
+            _update_bg_status("done", 100, False, project_id,
+                              analyzed_count=total_shots, total_count=total_shots)
+            return
+
+        _update_bg_status("analyzing", int(already_done / max(total_shots, 1) * 100),
+                          True, project_id,
+                          analyzed_count=already_done, total_count=total_shots)
 
         # 按视频分组
         from collections import defaultdict
@@ -209,17 +238,20 @@ def _background_analysis(project_id: str, video_paths: list):
             if vpath:
                 video_shots[vpath].append(shot)
 
-        total_shots = len(shots)
-        processed = 0
+        processed = already_done
+        dirty = False  # 标记是否有新的分析结果需要保存
 
         for vpath, shot_list in video_shots.items():
             if not os.path.exists(vpath):
-                processed += len(shot_list)
+                # 计算跳过的未分析镜头数（它们无法处理）
+                skipped = sum(1 for s in shot_list if not s.get("face_detected", False))
+                processed += skipped
                 continue
 
             cap = cv2.VideoCapture(vpath)
             if not cap.isOpened():
-                processed += len(shot_list)
+                skipped = sum(1 for s in shot_list if not s.get("face_detected", False))
+                processed += skipped
                 continue
 
             proj_dir = get_project_dir(project_id)
@@ -229,8 +261,17 @@ def _background_analysis(project_id: str, video_paths: list):
                 for shot in shot_list:
                     if _cancel_flag.is_set():
                         cap.release()
-                        _update_bg_status("done", 0, False, project_id)
+                        # ★ 取消时保存已完成的中间结果
+                        if dirty:
+                            save_project_data(project_id, project_data)
+                            logger.info(f"后台分析被取消，已保存中间结果: {processed}/{total_shots}")
+                        _update_bg_status("done", 0, False, project_id,
+                                          analyzed_count=processed, total_count=total_shots)
                         return
+
+                    # ★ 断点续传：跳过已完成分析的镜头
+                    if shot.get("face_detected", False):
+                        continue
 
                     start_f = shot.get("start_frame", 0)
                     end_f = shot.get("end_frame", start_f + 1)
@@ -245,7 +286,9 @@ def _background_analysis(project_id: str, video_paths: list):
                         shot["shot_type_detected"] = True
                         shot["motion_score"] = 0.0
                         processed += 1
-                        _update_bg_status("analyzing", int(processed / max(total_shots, 1) * 100))
+                        dirty = True
+                        _update_bg_status("analyzing", int(processed / max(total_shots, 1) * 100),
+                                          analyzed_count=processed, total_count=total_shots)
                         continue
 
                     # ── ① 快速预筛（YuNet + HOG 兜底）──
@@ -297,7 +340,12 @@ def _background_analysis(project_id: str, video_paths: list):
                     shot["motion_score"] = float(_calc_motion_from_frames(sampled_frames))
 
                     processed += 1
-                    _update_bg_status("analyzing", int(processed / max(total_shots, 1) * 100))
+                    dirty = True
+                    _update_bg_status("analyzing", int(processed / max(total_shots, 1) * 100),
+                                      analyzed_count=processed, total_count=total_shots)
+
+                    # ★ 让出 GIL，避免长时间阻塞 FastAPI 事件循环处理帧请求
+                    time.sleep(0.01)
 
             finally:
                 cap.release()
@@ -306,7 +354,8 @@ def _background_analysis(project_id: str, video_paths: list):
         save_project_data(project_id, project_data)
         logger.info(f"后台分析完成: {processed} 个镜头")
 
-        _update_bg_status("done", 100, False, project_id)
+        _update_bg_status("done", 100, False, project_id,
+                          analyzed_count=total_shots, total_count=total_shots)
 
     except Exception as e:
         logger.error(f"后台分析异常: {e}", exc_info=True)
@@ -814,7 +863,63 @@ async def get_bg_task_status():
             "current_video": _bg_task_status.get("current_video", ""),
             "split_queue": _bg_task_status.get("split_queue", 0),
             "split_done": _bg_task_status.get("split_done", 0),
+            "analyzed_count": _bg_task_status.get("analyzed_count", 0),
+            "total_count": _bg_task_status.get("total_count", 0),
         }
+
+
+@router.get("/analysis_completeness")
+async def get_analysis_completeness():
+    """检查当前项目的镜头分析完成度"""
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+
+    if not project_data:
+        return {"total": 0, "analyzed": 0, "pending": 0, "complete": True, "progress": 100}
+
+    shots = project_data.get("shots", [])
+    total = len(shots)
+
+    if total == 0:
+        return {"total": 0, "analyzed": 0, "pending": 0, "complete": True, "progress": 100}
+
+    # 判断标准：face_detected=True 表示该镜头已完成分析
+    analyzed = sum(1 for s in shots if s.get("face_detected", False))
+    pending = total - analyzed
+
+    return {
+        "total": total,
+        "analyzed": analyzed,
+        "pending": pending,
+        "complete": pending == 0,
+        "progress": int(analyzed / max(total, 1) * 100),
+    }
+
+
+@router.post("/resume_analysis")
+async def resume_analysis():
+    """恢复未完成的后台分析（断点续传）"""
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+
+    if not project_data:
+        return {"success": False, "message": "无项目数据"}
+
+    video_paths = project_data.get("video_paths", [])
+    if not video_paths:
+        return {"success": False, "message": "无视频"}
+
+    # 检查是否有未完成的镜头
+    shots = project_data.get("shots", [])
+    total = len(shots)
+    pending = sum(1 for s in shots if not s.get("face_detected", False))
+    if pending == 0:
+        return {"success": True, "message": "所有镜头已分析完成", "pending": 0, "total": total}
+
+    # 启动后台分析（会自动跳过已完成的镜头）
+    _start_background_analysis(project_id, video_paths)
+
+    return {"success": True, "pending": pending, "total": total}
 
 
 @router.get("/videos")
