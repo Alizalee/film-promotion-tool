@@ -15,6 +15,7 @@ let favoriteOnly = false;
 let searchQuery = '';
 let sourceVideoFilters = new Set(); // 多选视频源筛选（空 = 全部）
 let shotTypeFilter = null;    // 景别筛选: 近景人像/黄金人像/远景人像/空镜
+let peopleFilter = null;  // 人数筛选：null = 不筛选，1/2/3 = 只显示对应人数（3 代表 ≥3）
 let faceDetected = false;   // 当前项目是否已完成人脸检测
 let faceDetecting = false;  // 正在检测中
 let shotTypeDetected = false;  // 景别是否已分析

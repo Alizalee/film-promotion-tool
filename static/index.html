@@ -93,7 +93,7 @@
                 <span id="topbarProjectName">未选择项目</span>
             </span>
         </div>
-        <!-- 筛选栏：左侧景别+排序，右侧视图大小 -->
+        <!-- 筛选栏：左侧景别+人数，右侧排序+视图大小 -->
         <div class="filter-bar" id="filterBar">
             <div class="filter-bar-left">
                 <div class="filter-group" id="shotTypeControl">
@@ -104,12 +104,20 @@
                     <div class="filter-chip" data-type="空镜" onclick="setShotTypeFilter('空镜')">空镜 <span class="seg-count" id="countEmpty"></span></div>
                 </div>
                 <div class="filter-divider-v"></div>
+                <!-- 人数多选标签 -->
+                <div class="filter-group" id="peopleFilterControl">
+                    <span class="people-filter-label">人数</span>
+                    <div class="filter-chip" data-people="1" onclick="togglePeopleFilter(1)">1</div>
+                    <div class="filter-chip" data-people="2" onclick="togglePeopleFilter(2)">2</div>
+                    <div class="filter-chip" data-people="3" onclick="togglePeopleFilter(3)">≥3</div>
+                </div>
+            </div>
+            <div class="filter-bar-right">
                 <div class="filter-group" id="sortControl">
                     <div class="filter-chip active" data-sort="time" onclick="setSort('time')">时间顺序</div>
                     <div class="filter-chip" data-sort="motion" onclick="setSort('motion')">动态差异</div>
                 </div>
-            </div>
-            <div class="filter-bar-right">
+                <div class="filter-divider-v"></div>
                 <div class="filter-group grid-size-group" id="gridSizeControl" title="视图大小">
                     <div class="filter-chip" data-size="sm" onclick="setGridSize('sm')">小</div>
                     <div class="filter-chip active" data-size="md" onclick="setGridSize('md')">中</div>

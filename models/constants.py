@@ -42,8 +42,14 @@ THUMBNAIL_JPEG_QUALITY = 80
 
 # 人脸可辨识阈值（face_ratio >= 此值才计为可辨识人脸）
 # YuNet 精度高、误检率低，降低阈值以覆盖远景/大全景小人脸
-# 0.001 ≈ 1920×1080 画面中 45×45 像素的人脸
-MIN_FACE_RATIO = 0.001
+# 0.002 ≈ 1920×1080 画面中 ~60×60 像素的人脸
+MIN_FACE_RATIO = 0.002
+
+# ── 人脸相对比例过滤（区分主体人物 vs 背景路人） ──
+# 只有 face_ratio >= 最大脸 × FACE_RELATIVE_THRESHOLD 的脸才计入 face_count
+# 0.3 = 30%: 两人对话构图中较远的脸约为较近的 50%~70% → 能通过
+#            背景路人通常不到主体的 10% → 被过滤
+FACE_RELATIVE_THRESHOLD = 0.3
 
 # HOG 人体检测最小面积比例（低于此值很可能是误检：柱子/文字/光影）
 MIN_PERSON_RATIO = 0.02

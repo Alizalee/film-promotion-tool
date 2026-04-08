@@ -22,6 +22,14 @@ async function loadShots() {
             shots = shots.filter(s => sourceVideoFilters.has(s.source_video));
         }
 
+        // ★ 前端人数过滤（peopleFilter 非 null 时激活，单选）
+        if (peopleFilter !== null) {
+            shots = shots.filter(s => {
+                const count = Math.min(Math.max(s.face_count || 0, s.person_count || 0), 3);
+                return count === peopleFilter;
+            });
+        }
+
         allShots = shots;
         totalShots = data.total || 0;
         totalFavorites = data.favorite_count || 0;
@@ -91,8 +99,6 @@ async function loadShots() {
         if (currentSort === 'motion' && !bgTaskPolling) {
             if (data.motion_data_ready === false) {
                 showToast('动态值尚未计算，请等待分析完成后再排序', 'error');
-            } else {
-                showToast('按动态差异排序');
             }
         }
         if (shotTypeFilter && data.shot_type_data_ready === false && !bgTaskPolling) {
@@ -419,8 +425,6 @@ function setSort(sort) {
     } else if (sort === 'motion') {
         // 分析完成，但检查数据是否真的有效（延迟到 loadShots 回调）
         // toast 先不显示，在 loadShots 中根据 motion_data_ready 判断
-    } else {
-        showToast('按时间顺序排序');
     }
     loadShots();
 }
@@ -465,19 +469,12 @@ async function setShotTypeFilter(type) {
         }
 
         shotTypeDetecting = true;
-        showToast('正在分析镜头分类，首次需要几秒钟…');
 
         try {
             const result = await API.detectShotTypes();
             shotTypeDetected = true;
-            if (result.cached) {
-                showToast('分类分析完成（缓存）', 'success');
-            } else {
-                showToast(`已分析 ${result.detected} 个镜头`, 'success');
-            }
         } catch (err) {
             console.error('分类分析失败:', err);
-            showToast('分类分析失败', 'error');
             shotTypeDetecting = false;
             return;
         } finally {
@@ -491,6 +488,19 @@ async function setShotTypeFilter(type) {
     document.querySelectorAll('#shotTypeControl .filter-chip').forEach(el => {
         el.classList.toggle('active', el.dataset.type === (shotTypeFilter || ''));
     });
+
+    // ★ 空镜 → 重置并隐藏人数选择器；其他 → 恢复显示
+    const peopleControl = document.getElementById('peopleFilterControl');
+    const peopleDivider = peopleControl ? peopleControl.previousElementSibling : null; // .filter-divider-v
+    if (shotTypeFilter === '空镜') {
+        peopleFilter = null;
+        updatePeopleFilterVisual();
+        if (peopleControl) peopleControl.style.display = 'none';
+        if (peopleDivider && peopleDivider.classList.contains('filter-divider-v')) peopleDivider.style.display = 'none';
+    } else {
+        if (peopleControl) peopleControl.style.display = '';
+        if (peopleDivider && peopleDivider.classList.contains('filter-divider-v')) peopleDivider.style.display = '';
+    }
 
     loadShots();
 }
@@ -680,4 +690,28 @@ function setGridSize(size) {
         grid.classList.remove('grid-sm', 'grid-md', 'grid-lg');
         grid.classList.add('grid-' + size);
     }
+}
+
+/* ═══════════════════════════════════════════════════
+   人数单选标签 — 点击切换
+   ═══════════════════════════════════════════════════ */
+
+/**
+ * 切换人数筛选标签（单选：再次点击取消）
+ * @param {number} val - 人数值 (1/2/3, 3 代表 ≥3)
+ */
+function togglePeopleFilter(val) {
+    peopleFilter = (peopleFilter === val) ? null : val;
+    updatePeopleFilterVisual();
+    loadShots();
+}
+
+/**
+ * 更新人数标签的视觉状态（active class）
+ */
+function updatePeopleFilterVisual() {
+    document.querySelectorAll('#peopleFilterControl .filter-chip').forEach(chip => {
+        const v = parseInt(chip.dataset.people);
+        chip.classList.toggle('active', peopleFilter === v);
+    });
 }

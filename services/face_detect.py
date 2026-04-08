@@ -14,6 +14,7 @@ from models.constants import (
     MIN_PERSON_RATIO,
     FACE_RATIO_TIER_LOW,
     FACE_RATIO_TIER_HIGH,
+    FACE_RELATIVE_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,8 +252,14 @@ def detect_face_info(frame: np.ndarray) -> dict:
             result["has_person"] = True
         result["person_count"] = valid_person_count
 
-    # 统计可辨识人脸数量（face_ratio >= MIN_FACE_RATIO 的才算）
-    valid_face_count = sum(1 for r in all_face_ratios if r >= MIN_FACE_RATIO)
+    # 统计"视觉显著"的人脸数量（相对比例过滤）
+    # 规则：face_ratio >= max(最大脸 × FACE_RELATIVE_THRESHOLD, MIN_FACE_RATIO)
+    # 这样能过滤掉背景路人/群众演员的小脸，只保留同一叙事层级的主体人物
+    if all_face_ratios:
+        relative_threshold = max(max_face_ratio * FACE_RELATIVE_THRESHOLD, MIN_FACE_RATIO)
+        valid_face_count = sum(1 for r in all_face_ratios if r >= relative_threshold)
+    else:
+        valid_face_count = 0
 
     result["face_ratio"] = round(float(max_face_ratio), 4)
     result["person_ratio"] = round(float(max_person_ratio), 4)
@@ -297,9 +304,11 @@ def detect_face_info_from_frames(frames: Dict[int, np.ndarray], resize_width: in
     best_good_composition = False
     per_frame = {}
 
-    # 收集每帧的人数（用于中位数投票）
-    all_face_counts = []
-    all_person_counts = []
+    # face_count 取 face_ratio 最大帧的值（与 face_ratio 语义保持一致）
+    # person_count 取所有帧最大值（HOG 不太稳定，取最佳表现更合理）
+    best_face_count = 0
+    best_person_count = 0
+    best_face_ratio_for_count = 0.0  # 跟踪 face_ratio 最大的帧
 
     for fn, frame in frames.items():
         if frame is None:
@@ -328,13 +337,13 @@ def detect_face_info_from_frames(frames: Dict[int, np.ndarray], resize_width: in
         best_person_ratio = max(best_person_ratio, info["person_ratio"])
         if info["good_composition"]:
             best_good_composition = True
-        all_face_counts.append(info["face_count"])
-        all_person_counts.append(info["person_count"])
 
-    # 取中位数而非 max — 避免单帧 HOG 误检膨胀结果
-    import statistics
-    best_face_count = int(statistics.median(all_face_counts)) if all_face_counts else 0
-    best_person_count = int(statistics.median(all_person_counts)) if all_person_counts else 0
+        # face_count 取 face_ratio 最大帧的值（保持与 face_ratio 语义一致）
+        if info["face_ratio"] >= best_face_ratio_for_count:
+            best_face_ratio_for_count = info["face_ratio"]
+            best_face_count = info["face_count"]
+        # person_count 取最大值
+        best_person_count = max(best_person_count, info["person_count"])
 
     return {
         "has_person": best_has_person,

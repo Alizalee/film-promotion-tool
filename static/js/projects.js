@@ -664,6 +664,9 @@ function startBgTaskPolling() {
                 // 刷新项目列表数据
                 const projData = await API.getProjects();
                 allProjects = projData.projects || [];
+                // ★ 刷新 videoPaths（新上传的视频拆分完成后需要更新视频源列表）
+                const projInfo = await API.getProjectInfo();
+                videoPaths = projInfo.video_paths || [];
                 updateVideoSourceTags();
                 return;
             }
@@ -685,6 +688,9 @@ function startBgTaskPolling() {
                     // 更新项目列表数据
                     const projData = await API.getProjects();
                     allProjects = projData.projects || [];
+                    // ★ 刷新 videoPaths（新视频拆分完成后，视频源列表需要更新）
+                    const projInfo = await API.getProjectInfo();
+                    videoPaths = projInfo.video_paths || [];
                     updateVideoSourceTags();
                     // 刷新视频管理列表（如果下拉已打开）
                     if (document.getElementById('videoList')) {
