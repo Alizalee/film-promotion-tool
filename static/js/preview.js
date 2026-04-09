@@ -5,6 +5,63 @@
 
 let previewVideo = null;
 
+/**
+ * ★ 构图信息 HTML（裁头/安全区/头顶余量/黑边）
+ */
+function buildCompositionHTML(shot) {
+    if (shot.face_count === undefined || shot.face_count === 0) return '';
+    const cropped = shot.face_cropped ? '<span style="color:#e74c3c">裁头 ✗</span>' : '<span style="color:#2ecc71">裁头 ✓</span>';
+    const safe = shot.face_in_safe_zone === false ? '<span style="color:#e74c3c">安全区 ✗</span>' : '<span style="color:#2ecc71">安全区 ✓</span>';
+    const margin = shot.head_margin_ratio !== undefined ? `头顶余量 ${shot.head_margin_ratio.toFixed(2)}` : '';
+    const blackBars = shot.has_black_bars ? '黑边: 是' : '黑边: 否';
+    const issue = shot.composition_issue ? `<span style="color:#e67e22;margin-left:6px">⚠ ${shot.composition_issue}</span>` : '';
+    return `<span class="pv-debug-label">构图:</span> ${cropped} &nbsp; ${safe} &nbsp; ${margin} &nbsp; ${blackBars}${issue}`;
+}
+
+/**
+ * ★ 分类推理行 — 前端反推分类逻辑，生成可读推理文案
+ * 阈值与 constants.py 保持一致：0.07% / 0.7% / 7%
+ */
+function buildClassifyReason(shot) {
+    if (shot.face_ratio === undefined) return '';
+    const fr = shot.face_ratio;
+    const frPct = (fr * 100).toFixed(2);
+    const fc = shot.face_count || 0;
+    const cropped = shot.face_cropped || false;
+    const safe = shot.face_in_safe_zone !== false;
+
+    // 阈值（与 Python 端一致）
+    const DISTANT_MIN = 0.0007;  // 0.07%
+    const TIER_LOW = 0.007;      // 0.7%
+    const TIER_HIGH = 0.07;      // 7%
+
+    let reason = `FR中位数 ${frPct}%`;
+
+    if (fr > TIER_HIGH) {
+        reason += ` > 7% → 近景人像`;
+    } else if (fr >= TIER_LOW) {
+        reason += ` ∈ 黄金区间[0.7%, 7%]`;
+        if (cropped || !safe) {
+            const issues = [];
+            if (cropped) issues.push('裁头');
+            if (!safe) issues.push('贴边');
+            reason += ` → 构图${issues.join('+')}升级 → 近景人像`;
+        } else {
+            reason += ` + 构图合格 → 黄金人像`;
+        }
+    } else if (fr >= DISTANT_MIN) {
+        reason += ` ∈ [0.07%, 0.7%) → 远景人像`;
+    } else {
+        if (fc > 0) {
+            reason += ` < 0.07% 但有脸 → 远景人像`;
+        } else {
+            reason += ` < 0.07% 且无脸 → 空镜`;
+        }
+    }
+
+    return `<span class="pv-debug-label">推理:</span> <span class="pv-debug-value">${reason}</span>`;
+}
+
 // 同源视频镜头列表（按时间排序），用于时间轴展示
 let sameSourceShots = [];
 let sameSourceIndex = -1;  // 当前镜头在 sameSourceShots 中的索引
@@ -55,6 +112,12 @@ async function openPreview(shotId, index) {
     const debugFaceRatio = shot.face_ratio !== undefined ? (shot.face_ratio * 100).toFixed(2) + '%' : '?';
     const debugPersonRatio = shot.person_ratio !== undefined ? (shot.person_ratio * 100).toFixed(2) + '%' : '?';
     const debugHasPerson = shot.has_person ? '是' : '否';
+
+    // ★ 构图信息
+    const debugComposition = buildCompositionHTML(shot);
+
+    // ★ 分类推理行
+    const debugReason = buildClassifyReason(shot);
 
     // 每帧详情
     let perFrameDebugHTML = '';
@@ -114,10 +177,12 @@ async function openPreview(shotId, index) {
                         </div>
                         <div class="pv-debug-row">
                             <span class="pv-debug-label">人脸占比:</span>
-                            <span class="pv-debug-value">${debugFaceRatio}</span>
+                            <span class="pv-debug-value">${debugFaceRatio}(中位数)</span>
                             <span class="pv-debug-label">人体占比:</span>
                             <span class="pv-debug-value">${debugPersonRatio}</span>
                         </div>
+                        ${debugComposition ? `<div class="pv-debug-row">${debugComposition}</div>` : ''}
+                        ${debugReason ? `<div class="pv-debug-row pv-debug-reason">${debugReason}</div>` : ''}
                         ${perFrameDebugHTML ? `<div class="pv-debug-row pv-debug-per-frame">${perFrameDebugHTML}</div>` : ''}
                     </div>
                 </div>
@@ -736,6 +801,12 @@ async function switchPreviewTo(shot, listIndex) {
         const debugPersonRatio = shot.person_ratio !== undefined ? (shot.person_ratio * 100).toFixed(2) + '%' : '?';
         const debugHasPerson = shot.has_person ? '是' : '否';
 
+        // ★ 构图信息
+        const debugComposition = buildCompositionHTML(shot);
+
+        // ★ 分类推理行
+        const debugReason = buildClassifyReason(shot);
+
         let perFrameDebugHTML = '';
         if (shot.per_frame_debug && Object.keys(shot.per_frame_debug).length > 0) {
             const entries = Object.entries(shot.per_frame_debug);
@@ -759,10 +830,12 @@ async function switchPreviewTo(shot, listIndex) {
             </div>
             <div class="pv-debug-row">
                 <span class="pv-debug-label">人脸占比:</span>
-                <span class="pv-debug-value">${debugFaceRatio}</span>
+                <span class="pv-debug-value">${debugFaceRatio}(中位数)</span>
                 <span class="pv-debug-label">人体占比:</span>
                 <span class="pv-debug-value">${debugPersonRatio}</span>
             </div>
+            ${debugComposition ? `<div class="pv-debug-row">${debugComposition}</div>` : ''}
+            ${debugReason ? `<div class="pv-debug-row pv-debug-reason">${debugReason}</div>` : ''}
             ${perFrameDebugHTML ? `<div class="pv-debug-row pv-debug-per-frame">${perFrameDebugHTML}</div>` : ''}
         `;
     }

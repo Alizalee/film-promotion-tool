@@ -574,6 +574,7 @@ function hideReanalyzeBtn() {
 
 /**
  * 执行重新分析 — 用新灵敏度重新切分所有视频
+ * ★ 快速返回模式：后端立即返回，前端启动轮询跟踪进度
  */
 async function doReanalyze() {
     if (isAnalyzing) {
@@ -588,29 +589,17 @@ async function doReanalyze() {
     shotTypeDetected = false;
     faceDetected = false;
 
-    showAnalyzeProgress('正在以新灵敏度重新分析…');
-    showProgress(30);
-
     try {
         const result = await API.reanalyze(threshold);
 
-        if (result.cancelled || _analysisCancelled) {
-            showToast('重新分析已取消', 'success');
-        } else if (result.success) {
-            totalShots = result.total_shots || 0;
-            fps = result.fps || fps;
-            showProgress(100);
-
-            let msg = `重新分析完成，检测到 ${result.total_shots} 个镜头`;
-            if (result.favorites_restored > 0) {
-                msg += `，已恢复 ${result.favorites_restored} 个收藏`;
-            }
-            showToast(msg, 'success');
+        if (result.success && result.bg_analyzing) {
+            // ★ 后端已快速返回，启动后台轮询跟踪重切分+分析进度
             hideReanalyzeBtn();
+            showToast('重新分析已启动，后台处理中…', 'success');
 
-            if (result.bg_analyzing) {
-                startBgTaskPolling();
-            }
+            // 切回镜头视图（显示空状态或旧镜头，等拆分完成后轮询刷新）
+            showShotsView();
+            startBgTaskPolling();
         } else {
             showToast('重新分析失败', 'error');
         }
@@ -620,13 +609,7 @@ async function doReanalyze() {
         }
     }
 
-    hideProgress();
     isAnalyzing = false;
-
-    // 刷新视图
-    const projData = await API.getProjects();
-    allProjects = projData.projects || [];
-    await initProjectView();
 }
 
 /* ═══════════════════════════════════════════════════

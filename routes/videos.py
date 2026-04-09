@@ -36,6 +36,7 @@ from services.face_detect import (
     detect_face_info_from_frames,
     quick_triage_from_frames,
     _calc_box_ratio,
+    get_effective_region_cached,
 )
 from services.shot_type_detect import classify_shot_label
 
@@ -257,6 +258,9 @@ def _background_analysis(project_id: str, video_paths: list):
             proj_dir = get_project_dir(project_id)
             frames_dir = os.path.join(proj_dir, "frames")
 
+            # ★ 每个视频只做一次黑边检测（从第 30 帧取有效区域）
+            effective_region = get_effective_region_cached(vpath)
+
             try:
                 for shot in shot_list:
                     if _cancel_flag.is_set():
@@ -295,8 +299,11 @@ def _background_analysis(project_id: str, video_paths: list):
                     triage = quick_triage_from_frames(sampled_frames)
 
                     if triage["worth"]:
-                        # ── ② 深度人像检测（复用同一批帧）──
-                        face_result = detect_face_info_from_frames(sampled_frames)
+                        # ── ② 深度人像检测（复用同一批帧，传入有效区域去黑边）──
+                        face_result = detect_face_info_from_frames(
+                            sampled_frames,
+                            effective_region=effective_region,
+                        )
 
                         shot["has_person"] = bool(face_result["has_person"])
                         shot["face_ratio"] = float(face_result["face_ratio"])
@@ -305,11 +312,18 @@ def _background_analysis(project_id: str, video_paths: list):
                         shot["face_count"] = int(face_result.get("face_count", 0))
                         shot["person_count"] = int(face_result.get("person_count", 0))
                         shot["face_detected"] = True
+                        # ★ 新增构图信息字段
+                        shot["face_cropped"] = bool(face_result.get("face_cropped", False))
+                        shot["face_in_safe_zone"] = bool(face_result.get("face_in_safe_zone", True))
+                        shot["head_margin_ratio"] = float(face_result.get("head_margin_ratio", 1.0))
+                        shot["has_black_bars"] = bool(face_result.get("has_black_bars", False))
 
-                        # 景别分类（基于人脸占比）
+                        # 景别分类（基于人脸占比 + 构图安全性）
                         shot["shot_type"] = classify_shot_label(
                             face_count=shot["face_count"],
                             face_ratio=shot.get("face_ratio", 0.0),
+                            face_cropped=shot.get("face_cropped", False),
+                            face_in_safe_zone=shot.get("face_in_safe_zone", True),
                         )
                         shot["shot_type_detected"] = True
 
@@ -739,10 +753,138 @@ async def analyze_append(req: AnalyzeAppendRequest):
     }
 
 
+def _reanalyze_background_task(project_id: str, video_paths: list, threshold: int, favorite_ranges: list):
+    """
+    后台重新分析任务 — 用新灵敏度重新切分所有视频的镜头。
+    在后台线程中执行，避免阻塞 FastAPI 事件循环。
+    """
+    try:
+        total = len(video_paths)
+        _update_bg_status("splitting", 0, True, project_id,
+                          current_video=os.path.basename(video_paths[0]) if video_paths else "",
+                          split_queue=total, split_done=0)
+
+        # 准备帧输出目录
+        proj_dir = get_project_dir(project_id)
+        frames_dir = os.path.join(proj_dir, "frames")
+
+        # 清空旧帧文件
+        if os.path.exists(frames_dir):
+            shutil.rmtree(frames_dir)
+        os.makedirs(frames_dir, exist_ok=True)
+
+        # 清空有效区域缓存（重新分析时应重新检测黑边）
+        from services.face_detect import _effective_region_cache
+        _effective_region_cache.clear()
+
+        # 对所有视频重新进行场景检测 + 快速构建
+        all_new_shots = []
+        latest_fps = 24
+        latest_total_frames = 0
+
+        for i, vpath in enumerate(video_paths):
+            if _cancel_flag.is_set():
+                break
+
+            if not os.path.exists(vpath):
+                continue
+
+            _update_bg_status("splitting", int(i / total * 50), True, project_id,
+                              current_video=os.path.basename(vpath),
+                              split_queue=total - i, split_done=i)
+
+            try:
+                scenes, fps, total_frames = detect_scenes(vpath, threshold)
+                latest_fps = fps
+                latest_total_frames = total_frames
+
+                if _cancel_flag.is_set():
+                    break
+
+                new_shots = build_shots_fast(
+                    scenes=scenes,
+                    fps=fps,
+                    video_path=vpath,
+                    frames_dir=frames_dir,
+                    index_offset=len(all_new_shots),
+                    cancel_check=is_cancelled,
+                )
+                all_new_shots.extend(new_shots)
+
+            except Exception as e:
+                logger.error(f"重新分析 {os.path.basename(vpath)} 失败: {e}", exc_info=True)
+                continue
+
+            _update_bg_status("splitting", int((i + 1) / total * 50), True, project_id,
+                              current_video="",
+                              split_queue=total - i - 1, split_done=i + 1)
+
+        if _cancel_flag.is_set():
+            _update_bg_status("done", 0, False, project_id,
+                              current_video="", split_queue=0, split_done=0)
+            return
+
+        # 恢复收藏状态：新 shot 的时间范围与旧收藏 shot 有重叠 → 标记为收藏
+        for new_shot in all_new_shots:
+            new_start = new_shot.get("start_time", 0)
+            new_end = new_shot.get("end_time", 0)
+            new_source = new_shot.get("source_video")
+            new_mid = (new_start + new_end) / 2
+
+            for fav in favorite_ranges:
+                if fav["source_video"] != new_source:
+                    continue
+                if fav["start_time"] <= new_mid <= fav["end_time"]:
+                    new_shot["favorite"] = True
+                    break
+
+        # 更新项目数据
+        project_data = load_project_data(project_id) or {}
+        project_data["shots"] = all_new_shots
+        project_data["fps"] = latest_fps
+        project_data["total_frames"] = latest_total_frames
+        save_project_data(project_id, project_data)
+
+        # 更新项目索引
+        update_project_info(
+            project_id,
+            shot_count=len(all_new_shots),
+        )
+
+        logger.info(f"重新分析拆分完成: {len(all_new_shots)} 个镜头")
+
+        # 全部拆分完成，进入深度分析阶段
+        if not _cancel_flag.is_set():
+            _background_analysis(project_id, video_paths)
+        else:
+            _update_bg_status("done", 0, False, project_id,
+                              current_video="", split_queue=0, split_done=0)
+
+    except Exception as e:
+        logger.error(f"后台重新分析异常: {e}", exc_info=True)
+        _update_bg_status("done", 0, False, project_id,
+                          current_video="", split_queue=0, split_done=0)
+
+
+def _start_reanalyze_background(project_id: str, video_paths: list, threshold: int, favorite_ranges: list):
+    """启动后台重新分析线程（先停止旧任务）"""
+    global _bg_task_thread
+    _stop_running_bg_task()
+    _cancel_flag.clear()
+    t = threading.Thread(
+        target=_reanalyze_background_task,
+        args=(project_id, video_paths, threshold, favorite_ranges),
+        daemon=True,
+    )
+    _bg_task_thread = t
+    t.start()
+
+
 @router.post("/reanalyze")
 async def reanalyze_all(req: ReanalyzeRequest):
     """
     重新分析 — 用新灵敏度阈值重新切分所有视频的镜头。
+    ★ 快速返回模式：验证参数 → 启动后台线程 → 立即返回。
     保留用户的收藏状态（通过时间范围匹配旧 shot 映射 favorite）。
     """
     project_id = _get_active_project_or_fail()
@@ -755,12 +897,9 @@ async def reanalyze_all(req: ReanalyzeRequest):
     if not video_paths:
         raise HTTPException(status_code=400, detail="没有视频可以重新分析")
 
-    # 清除取消标志
-    _cancel_flag.clear()
-
     threshold = req.threshold or DEFAULT_THRESHOLD
 
-    # 保存旧镜头的收藏状态（用时间范围做匹配）
+    # 保存旧镜头的收藏状态（用时间范围做匹配，传给后台线程）
     old_shots = project_data.get("shots", [])
     favorite_ranges = []
     for shot in old_shots:
@@ -771,83 +910,13 @@ async def reanalyze_all(req: ReanalyzeRequest):
                 "end_time": shot.get("end_time", 0),
             })
 
-    # 准备帧输出目录
-    proj_dir = get_project_dir(project_id)
-    frames_dir = os.path.join(proj_dir, "frames")
-
-    # 清空旧帧文件
-    if os.path.exists(frames_dir):
-        shutil.rmtree(frames_dir)
-    os.makedirs(frames_dir, exist_ok=True)
-
-    # 对所有视频重新进行场景检测 + 快速构建
-    all_new_shots = []
-    latest_fps = project_data.get("fps", 24)
-    latest_total_frames = project_data.get("total_frames", 0)
-
-    for vpath in video_paths:
-        if not os.path.exists(vpath):
-            continue
-
-        if is_cancelled():
-            return {"success": False, "cancelled": True, "message": "重新分析已取消"}
-
-        scenes, fps, total_frames = detect_scenes(vpath, threshold)
-        latest_fps = fps
-        latest_total_frames = total_frames
-
-        if is_cancelled():
-            return {"success": False, "cancelled": True, "message": "重新分析已取消"}
-
-        new_shots = build_shots_fast(
-            scenes=scenes,
-            fps=fps,
-            video_path=vpath,
-            frames_dir=frames_dir,
-            index_offset=len(all_new_shots),
-            cancel_check=is_cancelled,
-        )
-        all_new_shots.extend(new_shots)
-
-    if is_cancelled():
-        return {"success": False, "cancelled": True, "message": "重新分析已取消"}
-
-    # 恢复收藏状态：新 shot 的时间范围与旧收藏 shot 有重叠 → 标记为收藏
-    for new_shot in all_new_shots:
-        new_start = new_shot.get("start_time", 0)
-        new_end = new_shot.get("end_time", 0)
-        new_source = new_shot.get("source_video")
-        new_mid = (new_start + new_end) / 2
-
-        for fav in favorite_ranges:
-            if fav["source_video"] != new_source:
-                continue
-            # 新镜头的中点落在旧收藏镜头的时间范围内 → 认为匹配
-            if fav["start_time"] <= new_mid <= fav["end_time"]:
-                new_shot["favorite"] = True
-                break
-
-    # 更新项目数据
-    project_data["shots"] = all_new_shots
-    project_data["fps"] = latest_fps
-    project_data["total_frames"] = latest_total_frames
-    save_project_data(project_id, project_data)
-
-    # 更新项目索引
-    update_project_info(
-        project_id,
-        shot_count=len(all_new_shots),
-    )
-
-    # ★ 启动后台异步分析
-    _start_background_analysis(project_id, video_paths)
+    # ★ 启动后台线程处理重切分 + 深度分析，接口立即返回
+    _start_reanalyze_background(project_id, video_paths, threshold, favorite_ranges)
 
     return {
         "success": True,
-        "total_shots": len(all_new_shots),
-        "fps": latest_fps,
-        "favorites_restored": sum(1 for s in all_new_shots if s.get("favorite")),
         "bg_analyzing": True,
+        "video_count": len(video_paths),
     }
 
 

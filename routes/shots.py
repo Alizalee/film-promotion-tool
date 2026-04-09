@@ -23,7 +23,7 @@ from services.project_manager import (
 
 logger = logging.getLogger(__name__)
 from services.scene_detect import extract_frame, save_frame_jpeg, _video_hash, _frame_to_timecode, _frame_to_display_timecode
-from services.face_detect import detect_face_info, detect_face_info_multi_frame
+from services.face_detect import detect_face_info, detect_face_info_multi_frame, get_effective_region_cached
 from services.shot_type_detect import classify_shot_type, classify_shot_label
 
 router = APIRouter()
@@ -177,6 +177,9 @@ async def detect_faces_on_demand():
         if not os.path.exists(vpath):
             continue
 
+        # ★ 获取视频有效区域（去黑边），传入人脸检测
+        effective_region = get_effective_region_cached(vpath)
+
         for shot in shot_list:
             # ★ 多帧采样检测（25%、50%、75% 位置），替代只看首帧
             face_info = detect_face_info_multi_frame(
@@ -184,6 +187,7 @@ async def detect_faces_on_demand():
                 start_frame=shot.get("start_frame", 0),
                 end_frame=shot.get("end_frame", shot.get("start_frame", 0) + 1),
                 sample_count=3,
+                effective_region=effective_region,
             )
             shot["has_person"] = bool(face_info["has_person"])
             shot["face_ratio"] = float(face_info["face_ratio"])
@@ -192,6 +196,19 @@ async def detect_faces_on_demand():
             shot["face_count"] = int(face_info.get("face_count", 0))
             shot["person_count"] = int(face_info.get("person_count", 0))
             shot["per_frame_debug"] = face_info.get("per_frame", {})
+            # ★ 补写构图安全性字段（裁头/安全区/黑边）
+            shot["face_cropped"] = bool(face_info.get("face_cropped", False))
+            shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
+            shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
+            shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
+
+            # ★ 构图瑕疵标记（不影响分类，仅供前端展示）
+            issues = []
+            if shot["face_cropped"]:
+                issues.append("裁头")
+            if not shot["face_in_safe_zone"]:
+                issues.append("贴边")
+            shot["composition_issue"] = "/".join(issues)
 
             # 标记已检测（缓存标志）
             shot["face_detected"] = True
@@ -255,6 +272,9 @@ async def detect_shot_types():
             if not os.path.exists(vpath):
                 continue
 
+            # ★ 获取视频有效区域（去黑边），传入人脸检测
+            effective_region = get_effective_region_cached(vpath)
+
             for shot in shot_list:
                 # ★ 多帧采样检测（25%、50%、75% 位置）
                 face_info = detect_face_info_multi_frame(
@@ -262,6 +282,7 @@ async def detect_shot_types():
                     start_frame=shot.get("start_frame", 0),
                     end_frame=shot.get("end_frame", shot.get("start_frame", 0) + 1),
                     sample_count=3,
+                    effective_region=effective_region,
                 )
                 shot["has_person"] = bool(face_info["has_person"])
                 shot["face_ratio"] = float(face_info["face_ratio"])
@@ -270,14 +291,41 @@ async def detect_shot_types():
                 shot["face_count"] = int(face_info.get("face_count", 0))
                 shot["person_count"] = int(face_info.get("person_count", 0))
                 shot["per_frame_debug"] = face_info.get("per_frame", {})
+                # ★ 补写构图安全性字段（裁头/安全区/黑边）
+                shot["face_cropped"] = bool(face_info.get("face_cropped", False))
+                shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
+                shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
+                shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
+                # ★ 构图瑕疵标记
+                issues = []
+                if shot["face_cropped"]:
+                    issues.append("裁头")
+                if not shot["face_in_safe_zone"]:
+                    issues.append("贴边")
+                shot["composition_issue"] = "/".join(issues)
                 shot["face_detected"] = True
 
-    # 所有 pending 镜头进行分类（基于 face_count + face_ratio）
+    # 所有 pending 镜头进行分类（基于 face_count + face_ratio + 构图安全性）
     detected_count = 0
     for shot in pending:
         face_count = shot.get("face_count", 0)
         face_ratio = shot.get("face_ratio", 0.0)
-        shot["shot_type"] = classify_shot_label(face_count=face_count, face_ratio=face_ratio)
+        face_cropped = shot.get("face_cropped", False)
+        face_in_safe_zone = shot.get("face_in_safe_zone", True)
+        shot["shot_type"] = classify_shot_label(
+            face_count=face_count,
+            face_ratio=face_ratio,
+            face_cropped=face_cropped,
+            face_in_safe_zone=face_in_safe_zone,
+        )
+        # ★ 补写构图瑕疵标记（可能之前人脸检测时没有写入）
+        if not shot.get("composition_issue") and shot.get("composition_issue") != "":
+            issues = []
+            if face_cropped:
+                issues.append("裁头")
+            if not face_in_safe_zone:
+                issues.append("贴边")
+            shot["composition_issue"] = "/".join(issues)
         shot["shot_type_detected"] = True
         detected_count += 1
 

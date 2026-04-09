@@ -57,11 +57,27 @@ MIN_PERSON_RATIO = 0.02
 # ── 宣发人像分类阈值（基于最大人脸占画面比例） ──
 # 空镜: face_count == 0 且 face_ratio < 0.07%
 # 远景人像: 0.07% ≤ face_ratio < 0.7%（含 face_count=0 但有小人脸的情况）
-# 黄金人像: 0.7% ≤ face_ratio ≤ 3.7%
-# 近景人像: face_ratio > 3.7%
+# 黄金人像: 0.7% ≤ face_ratio ≤ 7%
+# 近景人像: face_ratio > 7%
 FACE_RATIO_DISTANT_MIN = 0.0007  # 远景人像最低门槛（0.07%），兜底 face_count=0 但有小人脸
 FACE_RATIO_TIER_LOW = 0.007      # 远景 / 黄金 分界线
-FACE_RATIO_TIER_HIGH = 0.037     # 黄金 / 近景 分界线
+FACE_RATIO_TIER_HIGH = 0.07      # 黄金 / 近景 分界线（适配去黑边后 face_ratio 整体偏大）
+
+# ── 构图安全性检测阈值（黄金人像优化） ──
+# 黑边检测：像素均值低于此阈值视为黑边（0~255 灰度值）
+BLACK_BAR_BRIGHTNESS_THRESHOLD = 20
+# 黑边最小占比：黑边宽度/高度 < 画面的 3% 时忽略（防误检）
+BLACK_BAR_MIN_RATIO = 0.03
+# 裁头检测：头顶到画面上边缘的距离 < 人脸高度 × 此值 → 判定裁头
+# 0.1 = 只有头顶非常贴近画面上边缘才判定裁头，减少中远景误判
+HEAD_MARGIN_CROP_THRESHOLD = 0.1
+# 头部扩展系数：YuNet 人脸框只到眉毛，头顶约在脸框上方 fh × 此值
+# 0.4 = 补偿到发际线/头顶位置，不过度扩展（避免中远景误判裁头）
+HEAD_EXTENSION_RATIO = 0.4
+# 安全区域：画面内缩比例（类似 TV Action Safe Area）
+SAFE_ZONE_MARGIN_RATIO = 0.05
+# 贴边检测：人脸框边缘距画面边缘 < min(宽,高) × 此值 → 判定贴边
+EDGE_THRESHOLD_RATIO = 0.02
 
 # 视频支持格式
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm"}
