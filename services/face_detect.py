@@ -670,33 +670,6 @@ def detect_face_info_multi_frame(
         cap.release()
 
 
-def detect_face_info_mid_frame(
-    video_path: str, mid_frame: int
-) -> dict:
-    """
-    只对镜头中间帧做人脸检测（兼容旧调用）
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return {"has_person": False, "face_ratio": 0.0, "good_composition": False}
-
-    try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            return {"has_person": False, "face_ratio": 0.0, "good_composition": False}
-
-        # 降采样到 640px 宽度加速检测
-        h, w = frame.shape[:2]
-        if w > 640:
-            scale = 640 / w
-            frame = cv2.resize(frame, (640, int(h * scale)))
-
-        return detect_face_info(frame)
-    finally:
-        cap.release()
-
-
 def quick_triage_from_frames(frames: Dict[int, np.ndarray]) -> dict:
     """
     快速预筛：基于已读帧，判断镜头是否值得深度分析。

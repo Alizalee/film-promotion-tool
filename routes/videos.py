@@ -28,7 +28,6 @@ from services.project_manager import (
 )
 from services.scene_detect import (
     detect_scenes,
-    build_shots_from_scenes,
     build_shots_fast,
     save_thumbnail,
 )

@@ -49,41 +49,4 @@ def classify_shot_label(
     return "空镜"
 
 
-def classify_shot_type(
-    has_person: bool = False,
-    face_ratio: float = 0.0,
-    frame=None,
-    face_count: int = 0,
-    face_cropped: bool = False,
-    face_in_safe_zone: bool = True,
-    **kwargs,
-) -> str:
-    """
-    兼容旧接口的分类函数 — 内部调用 classify_shot_label。
-    """
-    return classify_shot_label(
-        face_count=face_count,
-        face_ratio=face_ratio,
-        face_cropped=face_cropped,
-        face_in_safe_zone=face_in_safe_zone,
-    )
 
-
-def detect_shot_type_for_frame(
-    frame=None,
-    has_person: bool = False,
-    face_ratio: float = 0.0,
-    face_count: int = 0,
-    face_cropped: bool = False,
-    face_in_safe_zone: bool = True,
-    **kwargs,
-) -> str:
-    """
-    对单帧图像进行镜头分类。
-    """
-    return classify_shot_label(
-        face_count=face_count,
-        face_ratio=face_ratio,
-        face_cropped=face_cropped,
-        face_in_safe_zone=face_in_safe_zone,
-    )

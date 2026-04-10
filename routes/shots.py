@@ -27,7 +27,7 @@ from services.project_manager import (
 logger = logging.getLogger(__name__)
 from services.scene_detect import extract_frame, save_frame_jpeg, save_thumbnail, _video_hash, _frame_to_timecode, _frame_to_display_timecode
 from services.face_detect import detect_face_info, detect_face_info_multi_frame, get_effective_region_cached
-from services.shot_type_detect import classify_shot_type, classify_shot_label
+from services.shot_type_detect import classify_shot_label
 
 router = APIRouter()
 

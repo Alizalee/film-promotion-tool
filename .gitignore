@@ -14,8 +14,8 @@ workspace/uploads/
 workspace/projects/
 workspace/projects.json
 
-# DNN 模型文件（太大，start.sh 会自动下载）
-models/*.caffemodel
+# DNN 模型文件（YuNet ONNX 模型，首次运行自动下载）
+models/*.onnx
 
 # macOS 系统文件
 .DS_Store

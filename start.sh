@@ -50,26 +50,10 @@ source "$VENV_DIR/bin/activate"
 echo "📥 检查依赖..."
 pip install -q -r requirements.txt
 
-# ─── 下载 DNN 人脸检测模型 ───
+# ─── 检查模型目录 ───
 MODELS_DIR="$PROJECT_DIR/models"
 mkdir -p "$MODELS_DIR"
-
-PROTOTXT="$MODELS_DIR/deploy.prototxt"
-CAFFEMODEL="$MODELS_DIR/res10_300x300_ssd_iter_140000.caffemodel"
-
-if [ ! -f "$PROTOTXT" ]; then
-    echo "📥 下载人脸检测模型 (deploy.prototxt)..."
-    curl -sL -o "$PROTOTXT" \
-        "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-fi
-
-if [ ! -f "$CAFFEMODEL" ]; then
-    echo "📥 下载人脸检测模型 (caffemodel, ~10MB)..."
-    curl -sL -o "$CAFFEMODEL" \
-        "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-fi
-
-echo "✅ 模型就绪"
+echo "✅ 模型目录就绪（YuNet ONNX 模型将在首次运行时自动下载）"
 
 # ─── 创建工作空间 ───
 mkdir -p "$PROJECT_DIR/workspace/uploads"
