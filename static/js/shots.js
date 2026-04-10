@@ -237,6 +237,7 @@ function onShotHoverEnter(cardEl, shotId) {
 
     video.addEventListener('loadeddata', () => {
         video.currentTime = useClipMode ? 0 : shot.start_time;
+        video.playbackRate = 2;  // 外部 hover 预览固定 2 倍速
         video.play().then(() => {
             video.classList.add('playing');
             if (img) img.classList.add('has-video');

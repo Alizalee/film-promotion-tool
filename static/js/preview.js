@@ -224,6 +224,7 @@ async function openPreview(shotId, index) {
                         <span class="edit-badge">编辑中</span>
                     </div>
                     <button class="pv-btn-mute" id="pvMuteBtn" onclick="event.stopPropagation();togglePreviewMute()" title="静音 (M)">${pvMuted ? '🔇' : '🔊'}</button>
+                    <button class="pv-btn-speed ${pvPlaybackRate !== 1 ? 'is-speed-changed' : ''}" id="pvSpeedBtn" onclick="event.stopPropagation();cyclePlaybackRate()" title="倍速 (R)">${pvPlaybackRate === 1 ? '1x' : pvPlaybackRate + 'x'}</button>
                 </div>
 
                 <!-- 播放器区域 -->
@@ -337,6 +338,9 @@ async function openPreview(shotId, index) {
 
     // 应用静音状态
     previewVideo.muted = pvMuted;
+
+    // 应用倍速
+    previewVideo.playbackRate = pvPlaybackRate;
 
     // 初始化裁剪点（默认 = 镜头入出点）
     // ★ 只有当源视频不存在时才走 clip 模式（clip 时间从 0 开始）
@@ -525,6 +529,39 @@ function togglePreviewPlay() {
         previewVideo.play().catch(() => {});
     } else {
         previewVideo.pause();
+    }
+}
+
+/* ═══════════════════════════════════════════════════
+   倍速控制
+   ═══════════════════════════════════════════════════ */
+
+const SPEED_OPTIONS = [1, 1.5, 2, 0.5];
+
+/**
+ * 循环切换倍速
+ */
+function cyclePlaybackRate() {
+    const currentIdx = SPEED_OPTIONS.indexOf(pvPlaybackRate);
+    const nextIdx = (currentIdx + 1) % SPEED_OPTIONS.length;
+    pvPlaybackRate = SPEED_OPTIONS[nextIdx];
+    localStorage.setItem('pv_playback_rate', pvPlaybackRate);
+
+    if (previewVideo) {
+        previewVideo.playbackRate = pvPlaybackRate;
+    }
+    updateSpeedBtn();
+    showToast(`播放倍速: ${pvPlaybackRate}x`);
+}
+
+/**
+ * 更新倍速按钮显示
+ */
+function updateSpeedBtn() {
+    const btn = document.getElementById('pvSpeedBtn');
+    if (btn) {
+        btn.textContent = pvPlaybackRate === 1 ? '1x' : pvPlaybackRate + 'x';
+        btn.classList.toggle('is-speed-changed', pvPlaybackRate !== 1);
     }
 }
 
@@ -1070,6 +1107,7 @@ async function switchPreviewTo(shot, listIndex) {
         previewVideo.currentTime = shot.start_time;
         updatePvProgress();
         previewVideo.muted = pvMuted;
+        previewVideo.playbackRate = pvPlaybackRate;
         previewVideo.play().catch(() => {});
     } else {
         // 不同源视频（或 clip_file）：需要更换 src
@@ -1114,6 +1152,7 @@ async function switchPreviewTo(shot, listIndex) {
         previewVideo.addEventListener('loadedmetadata', onMeta, { once: true });
         previewVideo.addEventListener('canplay', () => {
             previewVideo.muted = pvMuted;
+            previewVideo.playbackRate = pvPlaybackRate;
             previewVideo.play().catch(() => {});
         }, { once: true });
     }
@@ -1379,6 +1418,11 @@ function onPreviewKeyDown(e) {
         case 'M':
             e.preventDefault();
             togglePreviewMute();
+            break;
+        case 'r':
+        case 'R':
+            e.preventDefault();
+            cyclePlaybackRate();
             break;
     }
 }

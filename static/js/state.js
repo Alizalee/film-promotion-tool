@@ -30,6 +30,7 @@ let currentPreviewShot = null;
 let currentPreviewIndex = -1;
 let previewMode = 'play'; // play | freeze | trim
 let pvMuted = false; // 预览弹窗静音状态（跨镜头保持）
+let pvPlaybackRate = parseFloat(localStorage.getItem('pv_playback_rate')) || 1.0; // 倍速（跨镜头保持）
 
 // 裁剪
 let trimStart = 0;
