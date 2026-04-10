@@ -35,7 +35,7 @@ function buildClassifyReason(shot) {
     const TIER_LOW = 0.007;      // 0.7%
     const TIER_HIGH = 0.07;      // 7%
 
-    let reason = `FR中位数 ${frPct}%`;
+    let reason = `FR最优帧 ${frPct}%`;
 
     if (fr > TIER_HIGH) {
         reason += ` > 7% → 近景人像`;
@@ -60,6 +60,96 @@ function buildClassifyReason(shot) {
     }
 
     return `<span class="pv-debug-label">推理:</span> <span class="pv-debug-value">${reason}</span>`;
+}
+
+/**
+ * ★ 差异标注 HTML — 比较两个数值，返回带箭头的差异标签
+ */
+function buildDiffTag(current, prev, isPercent) {
+    if (prev === undefined || prev === null || current === undefined || current === null) return '';
+    const diff = current - prev;
+    if (Math.abs(diff) < 0.0001) return '<span class="pv-debug-diff pv-debug-diff-same">＝</span>';
+    const arrow = diff > 0 ? '↑' : '↓';
+    const cls = diff > 0 ? 'pv-debug-diff-up' : 'pv-debug-diff-down';
+    const val = isPercent ? (Math.abs(diff) * 100).toFixed(2) + '%' : Math.abs(diff);
+    return `<span class="pv-debug-diff ${cls}">${arrow}${val}</span>`;
+}
+
+/**
+ * ★ 构建调试面板完整 HTML（含差异标注）
+ */
+function buildDebugPanelBodyHTML(shot, prevShot) {
+    const fc = shot.face_count !== undefined ? shot.face_count : '?';
+    const fr = shot.face_ratio !== undefined ? (shot.face_ratio * 100).toFixed(2) + '%' : '?';
+    const hasPerson = shot.has_person ? '是' : '否';
+
+    const diffFC = prevShot ? buildDiffTag(shot.face_count, prevShot.face_count, false) : '';
+    const diffFR = prevShot ? buildDiffTag(shot.face_ratio, prevShot.face_ratio, true) : '';
+
+    const composition = buildCompositionHTML(shot);
+    const reason = buildClassifyReason(shot);
+
+    let perFrameHTML = '';
+    if (shot.per_frame_debug && Object.keys(shot.per_frame_debug).length > 0) {
+        const entries = Object.entries(shot.per_frame_debug);
+        perFrameHTML = entries.map(([fn, info]) => {
+            return `<span class="pv-debug-frame">F${fn}: 脸${info.face_count} FR${(info.face_ratio * 100).toFixed(1)}%</span>`;
+        }).join('');
+    }
+
+    return `
+        <div class="pv-debug-row">
+            <span class="pv-debug-label">分类:</span>
+            <span class="pv-debug-value pv-debug-highlight">${shot.shot_type || '未分类'}</span>
+            <span class="pv-debug-label">有人:</span>
+            <span class="pv-debug-value">${hasPerson}</span>
+        </div>
+        <div class="pv-debug-row">
+            <span class="pv-debug-label">人脸数:</span>
+            <span class="pv-debug-value">${fc}${diffFC}</span>
+            <span class="pv-debug-label">人脸占比:</span>
+            <span class="pv-debug-value">${fr}${diffFR}</span>
+        </div>
+        ${composition ? `<div class="pv-debug-row">${composition}</div>` : ''}
+        ${reason ? `<div class="pv-debug-row pv-debug-reason">${reason}</div>` : ''}
+        ${perFrameHTML ? `<div class="pv-debug-section-title">逐帧详情</div><div class="pv-debug-row pv-debug-per-frame">${perFrameHTML}</div>` : ''}
+    `;
+}
+
+/**
+ * ★ 切换调试面板显示/隐藏
+ */
+function toggleDebugPanel() {
+    debugPanelVisible = !debugPanelVisible;
+    localStorage.setItem('pv_debug_visible', debugPanelVisible ? 'true' : 'false');
+    const panel = document.querySelector('.pv-debug-panel');
+    if (panel) {
+        panel.classList.toggle('visible', debugPanelVisible);
+    }
+    if (debugPanelVisible) {
+        showToast('调试面板已开启', 'success');
+    } else {
+        showToast('调试面板已关闭');
+    }
+}
+
+/**
+ * ★ 三连击标题检测 — 500ms 内点击 3 次触发
+ */
+function onDebugTitleClick() {
+    const now = Date.now();
+    titleClickTimestamps.push(now);
+    // 只保留最近 3 次
+    if (titleClickTimestamps.length > 3) {
+        titleClickTimestamps = titleClickTimestamps.slice(-3);
+    }
+    if (titleClickTimestamps.length === 3) {
+        const span = titleClickTimestamps[2] - titleClickTimestamps[0];
+        if (span <= 500) {
+            toggleDebugPanel();
+            titleClickTimestamps = [];
+        }
+    }
 }
 
 // 同源视频镜头列表（按时间排序），用于时间轴展示
@@ -106,27 +196,8 @@ async function openPreview(shotId, index) {
     const duration = formatDuration(shot.duration || 0);
     const sourceFile = shot.source_video ? shot.source_video.split('/').pop() : '';
 
-    // 构建调试信息
-    const debugFaceCount = shot.face_count !== undefined ? shot.face_count : '?';
-    const debugPersonCount = shot.person_count !== undefined ? shot.person_count : '?';
-    const debugFaceRatio = shot.face_ratio !== undefined ? (shot.face_ratio * 100).toFixed(2) + '%' : '?';
-    const debugPersonRatio = shot.person_ratio !== undefined ? (shot.person_ratio * 100).toFixed(2) + '%' : '?';
-    const debugHasPerson = shot.has_person ? '是' : '否';
-
-    // ★ 构图信息
-    const debugComposition = buildCompositionHTML(shot);
-
-    // ★ 分类推理行
-    const debugReason = buildClassifyReason(shot);
-
-    // 每帧详情
-    let perFrameDebugHTML = '';
-    if (shot.per_frame_debug && Object.keys(shot.per_frame_debug).length > 0) {
-        const entries = Object.entries(shot.per_frame_debug);
-        perFrameDebugHTML = entries.map(([fn, info]) => {
-            return `<span class="pv-debug-frame">F${fn}: 脸${info.face_count} 体${info.person_count} FR${(info.face_ratio * 100).toFixed(1)}% PR${(info.person_ratio * 100).toFixed(1)}%</span>`;
-        }).join('');
-    }
+    // 重置差异对比的前一镜头
+    prevDebugShot = null;
 
     // 判断列表导航是否可用
     const navPrevDisabled = index <= 0;
@@ -138,122 +209,134 @@ async function openPreview(shotId, index) {
 
         <!-- 预览容器 -->
         <div class="pv-container" onclick="event.stopPropagation()">
-            <!-- 预览主窗口 -->
-            <div class="pv-window">
+            <div class="pv-window" id="pvWindow">
                 <!-- 关闭按钮 -->
                 <button class="pv-close-btn" onclick="closePreview()">×</button>
 
+                <!-- 顶部标题（视频左上角浮动标签） -->
+                <div class="pv-header">
+                    <div class="pv-header-title" id="pvHeaderTitle">
+                        <span class="shot-num">#${shot.index + 1}</span>
+                        <span style="color:var(--text-tertiary)">·</span>
+                        <span class="shot-dur">${duration}</span>
+                        <span style="color:var(--text-tertiary)">·</span>
+                        <span class="shot-label">${shot.shot_type || ''}</span>
+                        <span class="edit-badge">编辑中</span>
+                    </div>
+                    <button class="pv-btn-mute" id="pvMuteBtn" onclick="event.stopPropagation();togglePreviewMute()" title="静音 (M)">${pvMuted ? '🔇' : '🔊'}</button>
+                </div>
+
                 <!-- 播放器区域 -->
-                <div class="pv-player-section">
+                <div class="pv-player-section" id="pvPlayerSection" onclick="togglePreviewPlay()">
                     <video id="previewVideoEl"
                            src="${getVideoUrl(shot.source_video, shot.id)}"
-                           preload="metadata"
-                           onclick="togglePreviewPlay()">
+                           preload="metadata">
                     </video>
 
-                    <!-- 镜头信息浮层 -->
-                    <div class="pv-shot-info">
-                        <div class="pv-shot-id">#${shot.index + 1}</div>
-                        <div class="pv-shot-details">
-                            <span class="pv-detail-item">⏱ ${duration}</span>
-                            <span class="pv-detail-item">${shot.shot_type || ''}</span>
-                            <span class="pv-detail-item" id="pvTimecodeOverlay">${shot.timecode_display || ''}</span>
-                        </div>
-                    </div>
-
-                    <!-- 调试信息浮层（检测标签详情） -->
-                    <div class="pv-debug-info">
-                        <div class="pv-debug-row">
-                            <span class="pv-debug-label">分类:</span>
-                            <span class="pv-debug-value pv-debug-highlight">${shot.shot_type || '未分类'}</span>
-                            <span class="pv-debug-label">有人:</span>
-                            <span class="pv-debug-value">${debugHasPerson}</span>
-                        </div>
-                        <div class="pv-debug-row">
-                            <span class="pv-debug-label">人脸数:</span>
-                            <span class="pv-debug-value">${debugFaceCount}</span>
-                            <span class="pv-debug-label">人体数:</span>
-                            <span class="pv-debug-value">${debugPersonCount}</span>
-                        </div>
-                        <div class="pv-debug-row">
-                            <span class="pv-debug-label">人脸占比:</span>
-                            <span class="pv-debug-value">${debugFaceRatio}(中位数)</span>
-                            <span class="pv-debug-label">人体占比:</span>
-                            <span class="pv-debug-value">${debugPersonRatio}</span>
-                        </div>
-                        ${debugComposition ? `<div class="pv-debug-row">${debugComposition}</div>` : ''}
-                        ${debugReason ? `<div class="pv-debug-row pv-debug-reason">${debugReason}</div>` : ''}
-                        ${perFrameDebugHTML ? `<div class="pv-debug-row pv-debug-per-frame">${perFrameDebugHTML}</div>` : ''}
-                    </div>
+                    <!-- 播放覆盖图标 -->
+                    <div class="pv-play-overlay" id="pvPlayOverlay">▶</div>
                 </div>
 
                 <!-- 控制栏区域 -->
                 <div class="pv-control-section">
-                    <!-- 同源镜头缩略图条（进度条上方） -->
-                    <div class="pv-thumb-strip" id="pvTimelineTrack">
-                        <!-- 等待同源镜头加载 -->
-                    </div>
 
-                    <!-- 源视频进度条 -->
-                    <div class="pv-progress-area">
-                        <div class="pv-source-label">
-                            <span>${sourceFile}</span>
-                            <span class="pv-nav-label" id="pvNavLabel">${index + 1} / ${allShots.length}</span>
-                            <span class="pv-source-time" id="pvSourceTime">${secondsToTimecode(shot.start_time, fps)}</span>
-                        </div>
-                        <div class="pv-progressbar" id="pvProgressbar" onmousedown="onPvProgressDown(event)">
-                            <!-- 当前镜头高亮范围 -->
-                            <div class="pv-shot-range" id="pvShotRange"></div>
-                            <!-- 入出点之间的裁剪范围 -->
-                            <div class="pv-trim-range" id="pvTrimRange"></div>
-                            <!-- 入点标记 -->
-                            <div class="pv-in-point" id="pvInPoint" title="入点"></div>
-                            <!-- 出点标记 -->
-                            <div class="pv-out-point" id="pvOutPoint" title="出点"></div>
-                            <!-- 播放头 -->
-                            <div class="pv-playhead" id="pvPlayhead"></div>
-                        </div>
-                    </div>
+                    <!-- 固定高度时间轴容器 -->
+                    <div class="pv-timeline-area">
 
-                    <!-- 控制按钮三栏布局 -->
-                    <div class="pv-controls-grid">
-                        <!-- 左栏: 播放控制 -->
-                        <div class="pv-ctrl-group">
+                        <!-- 缩略图条 -->
+                        <div class="pv-thumb-strip" id="pvTimelineTrack"></div>
+
+                        <!-- 信息行 -->
+                        <div class="pv-info-row">
+                            <span class="filename">${sourceFile}</span>
+                            <span class="nav-label" id="pvNavLabel">${index + 1} / ${allShots.length}</span>
+                            <span class="timecode" id="pvTimecode"><span class="tc-current">${secondsToTimecode(shot.start_time, fps)}</span><span class="tc-sep">/</span><span class="tc-total">00:00:00:00</span></span>
+                        </div>
+
+                        <!-- 进度条（固定高度容器） -->
+                        <div class="pv-progress-wrap">
+                            <div class="pv-progressbar" id="pvProgressbar" onmousedown="onPvProgressDown(event)">
+                                <div class="pv-timeline-ticks" id="pvTimelineTicks"></div>
+                                <div class="pv-shot-range" id="pvShotRange"></div>
+                                <div class="pv-trim-range" id="pvTrimRange"></div>
+                                <div class="pv-trim-handle pv-trim-handle-in" id="pvTrimIn" onmousedown="onTrimHandleDown(event,'in')"></div>
+                                <div class="pv-trim-handle pv-trim-handle-out" id="pvTrimOut" onmousedown="onTrimHandleDown(event,'out')"></div>
+                                <div class="pv-playhead" id="pvPlayhead"></div>
+                            </div>
+                        </div>
+
+                    </div><!-- /.pv-timeline-area -->
+
+                    <!-- 操作栏：三栏 grid，叠层切换 -->
+                    <div class="pv-toolbar">
+                        <!-- 左栏 — 叠层切换 -->
+                        <div class="pv-toolbar-group pv-toolbar-left">
+                            <div class="pv-layer pv-layer-preview">
+                                <button class="pv-btn pv-btn-edit-entry" onclick="event.stopPropagation();enterEditMode()">✎ 编辑镜头</button>
+                                <button class="pv-btn pv-btn-fav" id="pvFavBtn" onclick="event.stopPropagation();togglePreviewFavorite()">${shot.favorite ? '♥ 已收藏' : '♡ 收藏'}</button>
+                            </div>
+                            <div class="pv-layer pv-layer-edit">
+                                <button class="pv-btn pv-btn-ghost" onclick="event.stopPropagation();exitEditMode(false)">取消</button>
+                                <button class="pv-btn pv-btn-danger" onclick="event.stopPropagation();splitCurrentShot()">✂ 拆分</button>
+                            </div>
+                        </div>
+
+                        <!-- 中栏 — 播控固定不动 -->
+                        <div class="pv-toolbar-group pv-toolbar-center">
+                            <button class="pv-btn pv-btn-inout pv-edit-only" onclick="event.stopPropagation();setPlayheadAsIn()">⟦ 入点</button>
+                            <button class="pv-btn" onclick="event.stopPropagation();seekPreview(-0.5)">-0.5s</button>
+                            <button class="pv-btn" onclick="event.stopPropagation();seekPreview(-1/fps)">◀1帧</button>
                             <button class="pv-play-btn" id="pvPlayBtn" onclick="event.stopPropagation();togglePreviewPlay()">▶</button>
-                            <span class="pv-timecode" id="pvTimecode">${secondsToTimecode(shot.start_time, fps)}</span>
+                            <button class="pv-btn" onclick="event.stopPropagation();seekPreview(1/fps)">1帧▶</button>
+                            <button class="pv-btn" onclick="event.stopPropagation();seekPreview(0.5)">+0.5s</button>
+                            <button class="pv-btn pv-btn-inout pv-edit-only" onclick="event.stopPropagation();setPlayheadAsOut()">出点 ⟧</button>
                         </div>
 
-                        <!-- 中栏: 编辑操作 -->
-                        <div class="pv-ctrl-group pv-ctrl-center">
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();setPlayheadAsIn()">⟦ 入点</button>
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();seekPreview(-0.5)">⏮ -0.5s</button>
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();seekPreview(-1/fps)">◀ 1帧</button>
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();copyCurrentFrame()">📋 复制静帧</button>
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();seekPreview(1/fps)">1帧 ▶</button>
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();seekPreview(0.5)">+0.5s ⏭</button>
-                            <button class="pv-edit-btn" onclick="event.stopPropagation();setPlayheadAsOut()">出点 ⟧</button>
-                        </div>
-
-                        <!-- 右栏: 操作 -->
-                        <div class="pv-ctrl-group pv-ctrl-right">
-                            <button class="pv-action-btn" id="pvFavBtn" onclick="event.stopPropagation();togglePreviewFavorite()">
-                                ${shot.favorite ? '♥ 已收藏' : '♡ 收藏'}
-                            </button>
-                            <button class="pv-action-btn pv-action-primary" onclick="event.stopPropagation();exportCurrentShot()">⬇ 导出镜头</button>
+                        <!-- 右栏 — 叠层切换 -->
+                        <div class="pv-toolbar-group pv-toolbar-right">
+                            <div class="pv-layer pv-layer-preview">
+                                <button class="pv-btn" onclick="event.stopPropagation();copyCurrentFrame()">📋 复制帧</button>
+                                <button class="pv-btn pv-btn-primary" onclick="event.stopPropagation();exportCurrentShot()">⬇ 导出镜头</button>
+                            </div>
+                            <div class="pv-layer pv-layer-edit">
+                                <button class="pv-btn pv-btn-save" onclick="event.stopPropagation();saveEdit()">保存镜头</button>
+                            </div>
                         </div>
                     </div>
+
                 </div>
             </div>
         </div>
 
         <!-- 弹窗外右箭头 -->
         <button class="pv-outer-nav pv-outer-next" id="pvNavNext" onclick="event.stopPropagation();navigatePreview(1)" title="下一镜头 (→)" ${navNextDisabled ? 'disabled' : ''}>›</button>
+
+        <!-- 调试信息侧边面板 -->
+        <div class="pv-debug-panel ${debugPanelVisible ? 'visible' : ''}" onclick="event.stopPropagation()">
+            <div class="pv-debug-panel-header">
+                <span class="pv-debug-panel-title">调试信息</span>
+                <button class="pv-debug-panel-close" onclick="toggleDebugPanel()">×</button>
+            </div>
+            <div class="pv-debug-panel-body">
+                ${buildDebugPanelBodyHTML(shot, null)}
+            </div>
+        </div>
     `;
 
     document.body.appendChild(overlay);
 
+    // 绑定三连击标题开关调试面板
+    const headerTitle = document.getElementById('pvHeaderTitle');
+    if (headerTitle) {
+        headerTitle.addEventListener('click', onDebugTitleClick);
+        headerTitle.style.cursor = 'default';  // 不暴露可点击暗示
+    }
+
     // 获取视频元素
     previewVideo = document.getElementById('previewVideoEl');
+
+    // 应用静音状态
+    previewVideo.muted = pvMuted;
 
     // 初始化裁剪点（默认 = 镜头入出点）
     // ★ 只有当源视频不存在时才走 clip 模式（clip 时间从 0 开始）
@@ -278,6 +361,9 @@ async function openPreview(shotId, index) {
             }
         }
         previewVideo.currentTime = isClip ? 0 : shot.start_time;
+        // 更新总时长时间码
+        const tcTotal = document.querySelector('#pvTimecode .tc-total');
+        if (tcTotal) tcTotal.textContent = secondsToTimecode(totalDur, fps);
         updatePvProgress();
     });
 
@@ -335,6 +421,9 @@ async function openPreview(shotId, index) {
             activeItem.scrollIntoView({ inline: 'center', behavior: 'instant' });
         }
     });
+
+    // 初始化缩略图条拖拽滚动
+    initThumbDrag();
 }
 
 /**
@@ -346,12 +435,12 @@ function buildTimelineHTML() {
     }
 
     const currentIdx = sameSourceIndex;
-    // 显示当前镜头前后各 10 个
-    const start = Math.max(0, currentIdx - 10);
-    const end = Math.min(sameSourceShots.length, currentIdx + 11);
 
     let html = '';
-    for (let i = start; i < end; i++) {
+    // 前置占位 spacer，使第一个镜头也能通过 scrollIntoView 居中
+    html += '<div class="pv-strip-spacer"></div>';
+
+    for (let i = 0; i < sameSourceShots.length; i++) {
         const s = sameSourceShots[i];
         const isActive = i === currentIdx;
         html += `
@@ -363,6 +452,9 @@ function buildTimelineHTML() {
             </div>
         `;
     }
+
+    // 后置占位 spacer
+    html += '<div class="pv-strip-spacer"></div>';
     return html;
 }
 
@@ -391,6 +483,12 @@ function refreshTimeline() {
  */
 function closePreview() {
     stopBoundaryWatch();
+    // 如果在编辑模式，先退出（不保存）
+    if (pvEditMode) {
+        pvEditMode = false;
+        const pvWindow = document.getElementById('pvWindow');
+        if (pvWindow) pvWindow.classList.remove('edit-mode');
+    }
     const overlay = document.getElementById('previewOverlay');
     if (overlay) {
         if (previewVideo) {
@@ -403,8 +501,12 @@ function closePreview() {
     currentPreviewShot = null;
     currentPreviewIndex = -1;
     previewMode = 'play';
+    pvEditMode = false;
     sameSourceShots = [];
     sameSourceIndex = -1;
+    ticksInitialized = false;
+    prevDebugShot = null;
+    titleClickTimestamps = [];
     document.removeEventListener('keydown', onPreviewKeyDown);
 }
 
@@ -426,9 +528,43 @@ function togglePreviewPlay() {
     }
 }
 
+/**
+ * 切换预览静音
+ */
+function togglePreviewMute() {
+    if (!previewVideo) return;
+    pvMuted = !pvMuted;
+    previewVideo.muted = pvMuted;
+    updateMuteBtn();
+}
+
+/**
+ * 更新静音按钮图标
+ */
+function updateMuteBtn() {
+    const btn = document.getElementById('pvMuteBtn');
+    if (btn) {
+        btn.textContent = pvMuted ? '🔇' : '🔊';
+        btn.classList.toggle('is-muted', pvMuted);
+        btn.title = pvMuted ? '取消静音 (M)' : '静音 (M)';
+    }
+}
+
 function updatePvPlayBtn(isPlaying) {
     const btn = document.getElementById('pvPlayBtn');
-    if (btn) btn.textContent = isPlaying ? '⏸' : '▶';
+    const text = isPlaying ? '⏸' : '▶';
+    if (btn) {
+        btn.textContent = text;
+        btn.classList.toggle('is-playing', isPlaying);
+    }
+
+    // 播放覆盖图标联动
+    const overlay = document.getElementById('pvPlayOverlay');
+    if (overlay) overlay.textContent = text;
+
+    // playerSection playing class
+    const player = document.getElementById('pvPlayerSection');
+    if (player) player.classList.toggle('playing', isPlaying);
 }
 
 function seekPreview(offset) {
@@ -538,20 +674,17 @@ function updatePvProgress() {
         trimRange.style.width = `${Math.min(100 - Math.max(0, trimLeftPercent), trimWidthPercent)}%`;
     }
 
-    // 入出点标记 — 相对窗口范围
+    // 入出点拉手位置 — 相对窗口范围
     const inPercent = toPercent(trimStart);
     const outPercent = toPercent(trimEnd);
-    const inPoint = document.getElementById('pvInPoint');
-    const outPoint = document.getElementById('pvOutPoint');
-    if (inPoint) inPoint.style.left = `${Math.max(0, Math.min(100, inPercent))}%`;
-    if (outPoint) outPoint.style.left = `${Math.max(0, Math.min(100, outPercent))}%`;
+    const trimIn = document.getElementById('pvTrimIn');
+    const trimOut = document.getElementById('pvTrimOut');
+    if (trimIn) trimIn.style.left = `${Math.max(0, Math.min(100, inPercent))}%`;
+    if (trimOut) trimOut.style.left = `${Math.max(0, Math.min(100, outPercent))}%`;
 
-    // 更新时间码
-    const tc = document.getElementById('pvTimecode');
-    if (tc) tc.textContent = secondsToTimecode(current, fps);
-
-    const srcTime = document.getElementById('pvSourceTime');
-    if (srcTime) srcTime.textContent = secondsToTimecode(current, fps);
+    // 更新时间码（统一入口：信息行中 tc-current）
+    const tcCurrent = document.querySelector('#pvTimecode .tc-current');
+    if (tcCurrent) tcCurrent.textContent = secondsToTimecode(current, fps);
 }
 
 /**
@@ -559,6 +692,10 @@ function updatePvProgress() {
  */
 function onPvProgressDown(e) {
     if (!previewVideo || !currentPreviewShot) return;
+    // 如果点击的是拉手，不处理（由 onTrimHandleDown 处理）
+    if (e.target.classList.contains('pv-trim-handle') ||
+        e.target.classList.contains('pv-trim-handle-in') ||
+        e.target.classList.contains('pv-trim-handle-out')) return;
     e.preventDefault();
 
     isSeeking = true;
@@ -587,9 +724,106 @@ function onPvProgressDown(e) {
 }
 
 /* ═══════════════════════════════════════════════════
-   入出点 & 裁剪
+   编辑模式：入出点 & 裁剪 & 拆分
    ═══════════════════════════════════════════════════ */
 
+/**
+ * 进入编辑模式 — CSS class 驱动
+ */
+function enterEditMode() {
+    if (!currentPreviewShot || pvEditMode) return;
+
+    pvEditMode = true;
+    // 记录原始入出点，取消时恢复
+    pvEditOrigTrimStart = trimStart;
+    pvEditOrigTrimEnd = trimEnd;
+
+    // ★ CSS class 驱动模式切换
+    const pvWindow = document.getElementById('pvWindow');
+    if (pvWindow) pvWindow.classList.add('edit-mode');
+
+    // 初始化时间轴刻度线（只生成一次）
+    initTimelineTicks();
+
+    updatePvProgress();
+    showToast('已进入编辑模式 — 可调整入出点或拆分镜头');
+}
+
+/**
+ * 退出编辑模式 — CSS class 驱动
+ * @param {boolean} saved - 是否已保存（false = 取消，恢复原始值）
+ */
+function exitEditMode(saved) {
+    if (!pvEditMode) return;
+
+    pvEditMode = false;
+
+    if (!saved) {
+        // 取消 → 恢复原始入出点
+        trimStart = pvEditOrigTrimStart;
+        trimEnd = pvEditOrigTrimEnd;
+    }
+
+    // ★ CSS class 驱动模式切换
+    const pvWindow = document.getElementById('pvWindow');
+    if (pvWindow) pvWindow.classList.remove('edit-mode');
+
+    updatePvProgress();
+}
+
+/**
+ * 保存编辑（入出点裁剪）
+ */
+async function saveEdit() {
+    if (!currentPreviewShot) return;
+
+    const shot = currentPreviewShot;
+    const isClipShot = !!shot.clip_file && !shot.source_video_exists;
+    const baseStart = isClipShot ? 0 : shot.start_time;
+    const baseEnd = isClipShot ? shot.duration : shot.end_time;
+
+    // 检查是否有变化
+    if (Math.abs(trimStart - baseStart) < 0.01 && Math.abs(trimEnd - baseEnd) < 0.01) {
+        showToast('入出点未修改');
+        exitEditMode(true);
+        return;
+    }
+
+    // clip_file 镜头不支持二次裁剪
+    if (isClipShot) {
+        showToast('独立片段不支持二次裁剪', 'error');
+        return;
+    }
+
+    try {
+        const result = await API.trimShot(shot.id, trimStart, trimEnd);
+        if (result.success) {
+            shot.start_time = result.start_time;
+            shot.end_time = result.end_time;
+            shot.duration = result.duration;
+
+            const listShot = allShots.find(s => s.id === shot.id);
+            if (listShot) {
+                listShot.start_time = result.start_time;
+                listShot.end_time = result.end_time;
+                listShot.duration = result.duration;
+            }
+
+            // 更新标题栏时长
+            const shotDur = document.querySelector('.pv-header-title .shot-dur');
+            if (shotDur) shotDur.textContent = formatDuration(result.duration);
+
+            showToast('裁剪已保存 ✓', 'success');
+            exitEditMode(true);
+        }
+    } catch (err) {
+        showToast('保存裁剪失败', 'error');
+    }
+}
+
+/**
+ * 设置入点
+ */
 function setPlayheadAsIn() {
     if (!previewVideo) return;
     trimStart = Math.max(0, Math.min(previewVideo.currentTime, trimEnd - 1/fps));
@@ -597,6 +831,9 @@ function setPlayheadAsIn() {
     showToast(`入点设为 ${secondsToTimecode(trimStart, fps)}`);
 }
 
+/**
+ * 设置出点
+ */
 function setPlayheadAsOut() {
     if (!previewVideo) return;
     const totalDur = previewVideo.duration || 1;
@@ -606,23 +843,20 @@ function setPlayheadAsOut() {
 }
 
 /**
- * 保存裁剪（如果入出点有变化）
+ * 保存裁剪（兼容旧的调用入口，如导出前自动保存）
  */
 async function saveTrimIfNeeded() {
     if (!currentPreviewShot) return;
     const shot = currentPreviewShot;
 
-    // ★ 只有源视频不存在时才用 clip 模式的基准时间
     const isClipShot = !!shot.clip_file && !shot.source_video_exists;
     const baseStart = isClipShot ? 0 : shot.start_time;
     const baseEnd = isClipShot ? shot.duration : shot.end_time;
 
-    // 只在入出点有变化时保存
     if (Math.abs(trimStart - baseStart) < 0.01 && Math.abs(trimEnd - baseEnd) < 0.01) {
         return;
     }
 
-    // ★ clip_file 镜头目前不支持二次裁剪（已经是独立片段）
     if (isClipShot) {
         return;
     }
@@ -644,6 +878,98 @@ async function saveTrimIfNeeded() {
         }
     } catch (err) {
         showToast('保存裁剪失败', 'error');
+    }
+}
+
+/* ═══════════════════════════════════════════════════
+   拆分镜头
+   ═══════════════════════════════════════════════════ */
+
+/**
+ * 拆分当前镜头：在当前播放头位置将镜头一分为二
+ */
+async function splitCurrentShot() {
+    if (!currentPreviewShot || !previewVideo) return;
+
+    const shot = currentPreviewShot;
+    const splitTime = previewVideo.currentTime;
+
+    // 校验：播放头必须在镜头范围内（且不在起止点附近）
+    const minGap = 2 / fps; // 至少 2 帧
+    if (splitTime <= shot.start_time + minGap || splitTime >= shot.end_time - minGap) {
+        showToast('播放头需在镜头范围内（且距头尾至少2帧）', 'error');
+        return;
+    }
+
+    // clip 模式镜头不支持拆分
+    const isClipShot = !!shot.clip_file && !shot.source_video_exists;
+    if (isClipShot) {
+        showToast('独立片段不支持拆分', 'error');
+        return;
+    }
+
+    // 显示确认弹窗
+    const splitTimeStr = secondsToTimecode(splitTime, fps);
+    const partADur = formatDuration(splitTime - shot.start_time);
+    const partBDur = formatDuration(shot.end_time - splitTime);
+
+    const confirmed = confirm(
+        `确认在 ${splitTimeStr} 处拆分镜头？\n\n` +
+        `镜头A: ${secondsToTimecode(shot.start_time, fps)} → ${splitTimeStr}（${partADur}）\n` +
+        `镜头B: ${splitTimeStr} → ${secondsToTimecode(shot.end_time, fps)}（${partBDur}）`
+    );
+
+    if (!confirmed) return;
+
+    try {
+        showToast('正在拆分镜头…');
+        const result = await API.splitShot(shot.id, splitTime);
+
+        if (result.success) {
+            // ★ 拆分闪烁动画
+            const player = document.getElementById('pvPlayerSection');
+            if (player) {
+                const flash = document.createElement('div');
+                flash.className = 'split-flash';
+                player.appendChild(flash);
+                setTimeout(() => flash.remove(), 600);
+            }
+
+            // 更新全局镜头列表
+            const removedId = result.removed_id;
+            const shotA = result.shot_a;
+            const shotB = result.shot_b;
+
+            // 从 allShots 中移除原镜头
+            const origIdx = allShots.findIndex(s => s.id === removedId);
+            if (origIdx >= 0) {
+                allShots.splice(origIdx, 1, shotA, shotB);
+            }
+
+            // 重建索引
+            allShots.forEach((s, i) => s.index = i);
+
+            // 退出编辑模式
+            pvEditMode = false;
+            const pvWindow = document.getElementById('pvWindow');
+            if (pvWindow) pvWindow.classList.remove('edit-mode');
+
+            // 切换预览到拆分后的第一个镜头
+            const newIndex = allShots.findIndex(s => s.id === shotA.id);
+            await switchPreviewTo(shotA, newIndex >= 0 ? newIndex : origIdx);
+
+            // 刷新网格
+            if (typeof loadShots === 'function') {
+                loadShots();
+            }
+
+            showToast('镜头已拆分 ✓', 'success');
+        } else {
+            showToast(result.detail || '拆分失败', 'error');
+        }
+    } catch (err) {
+        console.error('拆分镜头失败:', err);
+        showToast('拆分镜头失败', 'error');
     }
 }
 
@@ -697,8 +1023,13 @@ async function copyCurrentFrame() {
 async function switchPreviewTo(shot, listIndex) {
     if (!shot) return;
 
-    // 先保存之前的裁剪
-    saveTrimIfNeeded();
+    // 如果在编辑模式，先退出（不保存）
+    if (pvEditMode) {
+        exitEditMode(false);
+    }
+
+    // 先保存之前的裁剪（如果有修改）
+    await saveTrimIfNeeded();
 
     // 停止当前播放和边界监听
     stopBoundaryWatch();
@@ -733,8 +1064,12 @@ async function switchPreviewTo(shot, listIndex) {
             viewStart = Math.max(0, shot.start_time - 0.5);
             viewEnd = Math.min(totalDur, shot.end_time + 0.5);
         }
+        // 更新总时长时间码
+        const tcTotal = document.querySelector('#pvTimecode .tc-total');
+        if (tcTotal) tcTotal.textContent = secondsToTimecode(totalDur, fps);
         previewVideo.currentTime = shot.start_time;
         updatePvProgress();
+        previewVideo.muted = pvMuted;
         previewVideo.play().catch(() => {});
     } else {
         // 不同源视频（或 clip_file）：需要更换 src
@@ -771,84 +1106,49 @@ async function switchPreviewTo(shot, listIndex) {
                 }
             }
             previewVideo.currentTime = isClip ? 0 : shot.start_time;
+            // 更新总时长时间码
+            const tcTotal = document.querySelector('#pvTimecode .tc-total');
+            if (tcTotal) tcTotal.textContent = secondsToTimecode(totalDur, fps);
             updatePvProgress();
         };
         previewVideo.addEventListener('loadedmetadata', onMeta, { once: true });
         previewVideo.addEventListener('canplay', () => {
+            previewVideo.muted = pvMuted;
             previewVideo.play().catch(() => {});
         }, { once: true });
     }
 
-    // —— 更新信息浮层 ——
-    const shotIdEl = document.querySelector('.pv-shot-id');
-    if (shotIdEl) shotIdEl.textContent = `#${shot.index + 1}`;
-
-    const shotDetails = document.querySelector('.pv-shot-details');
-    if (shotDetails) {
-        shotDetails.innerHTML = `
-            <span class="pv-detail-item">⏱ ${duration}</span>
-            <span class="pv-detail-item">${shot.shot_type || ''}</span>
-            <span class="pv-detail-item" id="pvTimecodeOverlay">${shot.timecode_display || ''}</span>
-        `;
+    // —— 更新顶部标题栏 ——
+    const headerTitle = document.getElementById('pvHeaderTitle');
+    if (headerTitle) {
+        const shotNum = headerTitle.querySelector('.shot-num');
+        const shotDur = headerTitle.querySelector('.shot-dur');
+        const shotLabel = headerTitle.querySelector('.shot-label');
+        if (shotNum) shotNum.textContent = `#${shot.index + 1}`;
+        if (shotDur) shotDur.textContent = duration;
+        if (shotLabel) shotLabel.textContent = shot.shot_type || '';
     }
 
-    // —— 更新调试信息 ——
-    const debugInfo = document.querySelector('.pv-debug-info');
-    if (debugInfo) {
-        const debugFaceCount = shot.face_count !== undefined ? shot.face_count : '?';
-        const debugPersonCount = shot.person_count !== undefined ? shot.person_count : '?';
-        const debugFaceRatio = shot.face_ratio !== undefined ? (shot.face_ratio * 100).toFixed(2) + '%' : '?';
-        const debugPersonRatio = shot.person_ratio !== undefined ? (shot.person_ratio * 100).toFixed(2) + '%' : '?';
-        const debugHasPerson = shot.has_person ? '是' : '否';
-
-        // ★ 构图信息
-        const debugComposition = buildCompositionHTML(shot);
-
-        // ★ 分类推理行
-        const debugReason = buildClassifyReason(shot);
-
-        let perFrameDebugHTML = '';
-        if (shot.per_frame_debug && Object.keys(shot.per_frame_debug).length > 0) {
-            const entries = Object.entries(shot.per_frame_debug);
-            perFrameDebugHTML = entries.map(([fn, info]) => {
-                return `<span class="pv-debug-frame">F${fn}: 脸${info.face_count} 体${info.person_count} FR${(info.face_ratio * 100).toFixed(1)}% PR${(info.person_ratio * 100).toFixed(1)}%</span>`;
-            }).join('');
-        }
-
-        debugInfo.innerHTML = `
-            <div class="pv-debug-row">
-                <span class="pv-debug-label">分类:</span>
-                <span class="pv-debug-value pv-debug-highlight">${shot.shot_type || '未分类'}</span>
-                <span class="pv-debug-label">有人:</span>
-                <span class="pv-debug-value">${debugHasPerson}</span>
-            </div>
-            <div class="pv-debug-row">
-                <span class="pv-debug-label">人脸数:</span>
-                <span class="pv-debug-value">${debugFaceCount}</span>
-                <span class="pv-debug-label">人体数:</span>
-                <span class="pv-debug-value">${debugPersonCount}</span>
-            </div>
-            <div class="pv-debug-row">
-                <span class="pv-debug-label">人脸占比:</span>
-                <span class="pv-debug-value">${debugFaceRatio}(中位数)</span>
-                <span class="pv-debug-label">人体占比:</span>
-                <span class="pv-debug-value">${debugPersonRatio}</span>
-            </div>
-            ${debugComposition ? `<div class="pv-debug-row">${debugComposition}</div>` : ''}
-            ${debugReason ? `<div class="pv-debug-row pv-debug-reason">${debugReason}</div>` : ''}
-            ${perFrameDebugHTML ? `<div class="pv-debug-row pv-debug-per-frame">${perFrameDebugHTML}</div>` : ''}
-        `;
+    // —— 更新调试面板（侧边面板 + 差异数据） ——
+    const debugBody = document.querySelector('.pv-debug-panel-body');
+    if (debugBody) {
+        debugBody.innerHTML = buildDebugPanelBodyHTML(shot, prevDebugShot);
     }
+    // 记录当前镜头为下次的"前一镜头"
+    prevDebugShot = {
+        face_count: shot.face_count,
+        face_ratio: shot.face_ratio,
+    };
 
-    // —— 更新源文件名 ——
-    const sourceLabel = document.querySelector('.pv-source-label > span:first-child');
-    if (sourceLabel) sourceLabel.textContent = sourceFile;
+    // —— 更新信息行文件名 ——
+    const filenameEl = document.querySelector('.pv-info-row .filename');
+    if (filenameEl) filenameEl.textContent = sourceFile;
 
     // —— 更新收藏按钮 ——
     const favBtn = document.getElementById('pvFavBtn');
     if (favBtn) {
         favBtn.innerHTML = shot.favorite ? '♥ 已收藏' : '♡ 收藏';
-        favBtn.classList.toggle('pv-fav-active', !!shot.favorite);
+        favBtn.classList.toggle('active', !!shot.favorite);
     }
 
     // —— 更新导航标签和按钮状态 ——
@@ -858,8 +1158,11 @@ async function switchPreviewTo(shot, listIndex) {
     updatePvPlayBtn(false);
 
     // —— 更新时间码 ——
-    const tc = document.getElementById('pvTimecode');
-    if (tc) tc.textContent = secondsToTimecode(shot.start_time, fps);
+    const tcCurrent = document.querySelector('#pvTimecode .tc-current');
+    if (tcCurrent) tcCurrent.textContent = secondsToTimecode(shot.start_time, fps);
+
+    // —— 重置刻度线，下次编辑时重新生成 ——
+    ticksInitialized = false;
 
     // —— 异步加载同源镜头并刷新时间轴（如果源视频变了） ——
     if (shot.source_video) {
@@ -970,7 +1273,7 @@ async function togglePreviewFavorite() {
     const btn = document.getElementById('pvFavBtn');
     if (btn) {
         btn.innerHTML = newFav ? '♥ 已收藏' : '♡ 收藏';
-        btn.classList.toggle('pv-fav-active', newFav);
+        btn.classList.toggle('active', newFav);
     }
 
     // 更新列表中的状态
@@ -1018,8 +1321,11 @@ async function exportCurrentShot() {
 function onPreviewKeyDown(e) {
     switch (e.key) {
         case 'Escape':
-            saveTrimIfNeeded();
-            closePreview();
+            if (pvEditMode) {
+                exitEditMode(false);  // 编辑模式下 ESC 取消编辑
+            } else {
+                closePreview();
+            }
             break;
         case ' ':
             e.preventDefault();
@@ -1027,19 +1333,19 @@ function onPreviewKeyDown(e) {
             break;
         case 'ArrowLeft':
             e.preventDefault();
-            navigatePreview(-1);  // 列表中上一镜头
+            if (!pvEditMode) navigatePreview(-1);  // 编辑模式下禁用导航
             break;
         case 'ArrowRight':
             e.preventDefault();
-            navigatePreview(1);   // 列表中下一镜头
+            if (!pvEditMode) navigatePreview(1);
             break;
         case 'ArrowUp':
             e.preventDefault();
-            navigateSameSource(-1);  // 同源视频中时间线上一镜头
+            if (!pvEditMode) navigateSameSource(-1);
             break;
         case 'ArrowDown':
             e.preventDefault();
-            navigateSameSource(1);   // 同源视频中时间线下一镜头
+            if (!pvEditMode) navigateSameSource(1);
             break;
         case ',':
             e.preventDefault();
@@ -1052,12 +1358,129 @@ function onPreviewKeyDown(e) {
         case 'i':
         case 'I':
             e.preventDefault();
-            setPlayheadAsIn();
+            if (pvEditMode) setPlayheadAsIn();  // 只在编辑模式下生效
             break;
         case 'o':
         case 'O':
             e.preventDefault();
-            setPlayheadAsOut();
+            if (pvEditMode) setPlayheadAsOut();
+            break;
+        case 'e':
+        case 'E':
+            e.preventDefault();
+            if (!pvEditMode) enterEditMode();  // E 键进入编辑模式
+            break;
+        case 's':
+        case 'S':
+            e.preventDefault();
+            if (pvEditMode) saveEdit();  // S 键保存（编辑模式下）
+            break;
+        case 'm':
+        case 'M':
+            e.preventDefault();
+            togglePreviewMute();
             break;
     }
+}
+
+/* ═══════════════════════════════════════════════════
+   时间轴刻度线（编辑模式下显示）
+   ═══════════════════════════════════════════════════ */
+
+let ticksInitialized = false;
+
+/**
+ * 初始化时间轴刻度线（只生成一次）
+ */
+function initTimelineTicks() {
+    if (ticksInitialized) return;
+    const container = document.getElementById('pvTimelineTicks');
+    if (!container) return;
+
+    let html = '';
+    for (let i = 0; i <= 20; i++) {
+        const pct = i * 5;
+        const isMajor = i % 5 === 0;
+        const h = isMajor ? 36 : 12;
+        html += `<div class="pv-tick" style="left:${pct}%;height:${h}px">`;
+        if (isMajor) {
+            const sec = viewStart + (pct / 100) * (viewEnd - viewStart);
+            html += `<span class="pv-tick-label">${sec.toFixed(1)}s</span>`;
+        }
+        html += `</div>`;
+    }
+    container.innerHTML = html;
+    ticksInitialized = true;
+}
+
+/* ═══════════════════════════════════════════════════
+   缩略图条拖拽滚动
+   ═══════════════════════════════════════════════════ */
+
+function initThumbDrag() {
+    const strip = document.getElementById('pvTimelineTrack');
+    if (!strip) return;
+
+    let isDragging = false;
+    let startX = 0;
+    let scrollStart = 0;
+
+    strip.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        startX = e.pageX;
+        scrollStart = strip.scrollLeft;
+        strip.classList.add('dragging');
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        e.preventDefault();
+        const dx = e.pageX - startX;
+        strip.scrollLeft = scrollStart - dx;
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!isDragging) return;
+        isDragging = false;
+        strip.classList.remove('dragging');
+    });
+}
+
+/* ═══════════════════════════════════════════════════
+   入出点拉手拖拽
+   ═══════════════════════════════════════════════════ */
+
+function onTrimHandleDown(e, type) {
+    if (!previewVideo || !currentPreviewShot) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const bar = document.getElementById('pvProgressbar');
+    if (!bar) return;
+    const rect = bar.getBoundingClientRect();
+    const windowDur = viewEnd - viewStart;
+
+    function drag(clientX) {
+        const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        const time = viewStart + ratio * windowDur;
+
+        if (type === 'in') {
+            trimStart = Math.max(0, Math.min(time, trimEnd - 1 / fps));
+        } else {
+            const totalDur = previewVideo.duration || 1;
+            trimEnd = Math.max(trimStart + 1 / fps, Math.min(time, totalDur));
+        }
+        updatePvProgress();
+    }
+
+    drag(e.clientX);
+
+    const onMove = (me) => drag(me.clientX);
+    const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
 }

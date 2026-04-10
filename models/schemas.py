@@ -63,6 +63,11 @@ class MergeShotsRequest(BaseModel):
     shot_id_b: str
 
 
+class SplitShotRequest(BaseModel):
+    shot_id: str
+    split_time: float  # 拆分时间点（源视频绝对时间）
+
+
 # ─── 导出 ───
 
 class ExportShotsRequest(BaseModel):
@@ -74,6 +79,7 @@ class ExportShotsRequest(BaseModel):
 
 class VideoDeleteRequest(BaseModel):
     video_path: str
+    keep_favorites: bool = True  # 是否保留已收藏片段（裁剪后放入"其他片段"）
 
 
 class ReanalyzeRequest(BaseModel):
@@ -83,3 +89,7 @@ class ReanalyzeRequest(BaseModel):
 class BatchAnalyzeRequest(BaseModel):
     video_paths: list[str]
     threshold: Optional[int] = None
+
+
+class BatchDeleteShotsRequest(BaseModel):
+    shot_ids: list[str]

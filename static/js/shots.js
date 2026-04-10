@@ -25,7 +25,7 @@ async function loadShots() {
         // ★ 前端人数过滤（peopleFilter 非 null 时激活，单选）
         if (peopleFilter !== null) {
             shots = shots.filter(s => {
-                const count = Math.min(Math.max(s.face_count || 0, s.person_count || 0), 3);
+                const count = Math.min(s.face_count || 0, 3);
                 return count === peopleFilter;
             });
         }
@@ -317,40 +317,132 @@ function updateShotCount() {
 
 /**
  * 更新视频源 Checkbox 列表（sidebar）
+ * hover 时在鼠标旁显示 tooltip：时长 · 镜头数 · 文件大小
  */
-function updateVideoSourceTags() {
+async function updateVideoSourceTags() {
     const container = document.getElementById('videoSourceList');
     if (!container) return;
 
-    if (videoPaths.length === 0) {
+    // 获取视频详情（大小、镜头数、时长）
+    let videoDetails = {};
+    try {
+        const data = await API.getVideos();
+        (data.videos || []).forEach(v => {
+            videoDetails[v.path] = v;
+        });
+    } catch (e) { /* 静默失败 */ }
+
+    // ★ 用后端全量数据检查是否有孤儿 shots（不受 sourceVideoFilters 影响）
+    // 避免前端过滤后 orphan 被隐藏导致"其他片段"选项消失
+    let orphanCount = 0;
+    try {
+        const globalData = await API.getShots({ sort: 'time' });
+        orphanCount = (globalData.shots || []).filter(s => s.source_video === '__orphan__').length;
+    } catch (e) { /* 静默失败 */ }
+
+    if (videoPaths.length === 0 && orphanCount === 0) {
         container.innerHTML = '<div style="padding:4px 10px;font-size:11px;color:var(--text-tertiary)">暂无视频</div>';
         return;
     }
 
-    container.innerHTML = videoPaths.map((vpath) => {
+    let html = videoPaths.map((vpath) => {
         const filename = vpath.split('/').pop().split('\\').pop();
         const shortName = filename.length > 18 ? filename.substring(0, 15) + '...' : filename;
         const isChecked = sourceVideoFilters.size === 0 || sourceVideoFilters.has(vpath);
+
+        // 构建 tooltip 信息
+        const detail = videoDetails[vpath];
+        const shotCount = detail ? detail.shot_count : 0;
+        const sizeMB = detail ? detail.size_mb : 0;
+        const durationSec = detail ? (detail.duration_sec || 0) : 0;
+        const tooltipText = `${escapeHtml(filename)}\n${formatDuration(durationSec)} · ${shotCount} 个镜头 · ${formatFileSize(sizeMB)}`;
+
         return `
             <div class="sidebar-item ${isChecked ? 'checked' : ''}" 
                  data-video-path="${escapeHtml(vpath)}"
                  onclick="toggleVideoSourceFilter('${escapeHtml(vpath).replace(/'/g, "\\'")}')" 
-                 title="${escapeHtml(filename)}">
+                 onmouseenter="showVideoTooltip(event, '${escapeHtml(tooltipText).replace(/\n/g, '\\n').replace(/'/g, "\\'")}')"
+                 onmouseleave="hideVideoTooltip()">
                 <div class="sidebar-checkbox">✓</div>
                 <span class="sidebar-label">${escapeHtml(shortName)}</span>
                 <span class="sidebar-item-delete" onclick="event.stopPropagation();deleteVideoItem('${escapeHtml(vpath).replace(/'/g, "\\'")}', '${escapeHtml(filename).replace(/'/g, "\\'")}')" title="删除此视频">✕</span>
             </div>
         `;
     }).join('');
+
+    // ★ 孤儿片段分组（使用全量数据判断，确保取消勾选后选项不会消失）
+    if (orphanCount > 0) {
+        const isOrphanChecked = sourceVideoFilters.size === 0 || sourceVideoFilters.has('__orphan__');
+        html += `
+            <div class="sidebar-item ${isOrphanChecked ? 'checked' : ''}" 
+                 data-video-path="__orphan__"
+                 onclick="toggleVideoSourceFilter('__orphan__')">
+                <div class="sidebar-checkbox">✓</div>
+                <span class="sidebar-label">其他片段</span>
+                <span class="sidebar-badge">${orphanCount}</span>
+            </div>
+        `;
+    }
+
+    container.innerHTML = html;
+}
+
+/**
+ * 显示视频源 hover tooltip（跟随鼠标）
+ */
+function showVideoTooltip(event, text) {
+    let tip = document.getElementById('videoTooltip');
+    if (!tip) {
+        tip = document.createElement('div');
+        tip.id = 'videoTooltip';
+        tip.className = 'video-tooltip';
+        document.body.appendChild(tip);
+    }
+    tip.innerHTML = text.replace(/\n/g, '<br>');
+    tip.style.display = 'block';
+
+    // 跟随鼠标位置，偏移避免遮挡
+    const x = event.clientX + 14;
+    const y = event.clientY + 14;
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+
+    // 监听鼠标移动，tooltip 跟随
+    event.target.closest('.sidebar-item')._tooltipMove = function(e) {
+        tip.style.left = (e.clientX + 14) + 'px';
+        tip.style.top = (e.clientY + 14) + 'px';
+    };
+    event.target.closest('.sidebar-item').addEventListener('mousemove', event.target.closest('.sidebar-item')._tooltipMove);
+}
+
+/**
+ * 隐藏视频源 hover tooltip
+ */
+function hideVideoTooltip() {
+    const tip = document.getElementById('videoTooltip');
+    if (tip) tip.style.display = 'none';
+
+    // 移除 mousemove 监听
+    document.querySelectorAll('.sidebar-item').forEach(item => {
+        if (item._tooltipMove) {
+            item.removeEventListener('mousemove', item._tooltipMove);
+            delete item._tooltipMove;
+        }
+    });
 }
 
 /**
  * 切换视频源筛选（多选 checkbox）
  */
 function toggleVideoSourceFilter(vpath) {
+    // ★ 从 DOM 中检查是否有"其他片段"项，而非依赖已过滤的 allShots
+    const hasOrphans = !!document.querySelector('.sidebar-item[data-video-path="__orphan__"]');
+    const allPaths = [...videoPaths];
+    if (hasOrphans) allPaths.push('__orphan__');
+
     if (sourceVideoFilters.size === 0) {
         // 当前显示全部 → 反转为只取消勾选此项（即选中其它全部）
-        videoPaths.forEach(p => {
+        allPaths.forEach(p => {
             if (p !== vpath) sourceVideoFilters.add(p);
         });
     } else if (sourceVideoFilters.has(vpath)) {
@@ -362,7 +454,7 @@ function toggleVideoSourceFilter(vpath) {
     } else {
         sourceVideoFilters.add(vpath);
         // 如果全部选中，恢复为空（=全部）
-        if (sourceVideoFilters.size === videoPaths.length) {
+        if (sourceVideoFilters.size === allPaths.length) {
             sourceVideoFilters.clear();
         }
     }
@@ -620,6 +712,7 @@ function updateSelectionBar() {
     const bar = document.getElementById('selectionBar');
     const thumbsContainer = document.getElementById('selectionBarThumbs');
     const info = document.getElementById('selectionBarInfo');
+    const actionsContainer = document.getElementById('selectionBarActions');
 
     if (selectedShots.size === 0) {
         bar.classList.remove('visible');
@@ -629,6 +722,25 @@ function updateSelectionBar() {
     bar.classList.add('visible');
     updateSelectionBarPosition();
     info.textContent = `已选 ${selectedShots.size} 个`;
+
+    // ★ 动态渲染操作按钮
+    if (actionsContainer) {
+        // 检查选中镜头中是否有已收藏的
+        const hasAnyfavorited = Array.from(selectedShots).some(id => {
+            const s = allShots.find(x => x.id === id);
+            return s && s.favorite;
+        });
+
+        let btns = `<button class="btn-secondary selection-bar-btn" onclick="favoriteAllSelected()">全部收藏</button>`;
+        if (hasAnyfavorited) {
+            btns += `<button class="btn-secondary selection-bar-btn" onclick="unfavoriteAllSelected()">取消收藏</button>`;
+        }
+        btns += `<button class="btn-primary selection-bar-btn" onclick="openExportPanel()">导出镜头</button>`;
+        btns += `<button class="btn-text-danger selection-bar-btn" onclick="deleteSelectedShots()">删除</button>`;
+        btns += `<span class="selection-bar-divider">·</span>`;
+        btns += `<button class="btn-text selection-bar-btn" onclick="clearSelection()">取消</button>`;
+        actionsContainer.innerHTML = btns;
+    }
 
     // 渲染已选缩略图
     const selectedArr = Array.from(selectedShots);
@@ -673,6 +785,81 @@ async function favoriteAllSelected() {
     } catch (err) {
         showToast('批量收藏失败', 'error');
     }
+}
+
+/**
+ * 批量取消收藏选中的镜头
+ */
+async function unfavoriteAllSelected() {
+    if (selectedShots.size === 0) return;
+
+    // 只取消已收藏的
+    const favIds = Array.from(selectedShots).filter(id => {
+        const s = allShots.find(x => x.id === id);
+        return s && s.favorite;
+    });
+
+    if (favIds.length === 0) {
+        showToast('选中的镜头均未收藏', 'info');
+        return;
+    }
+
+    try {
+        showToast(`正在取消收藏 ${favIds.length} 个镜头…`);
+        await API.batchFavorite(favIds, false);
+
+        // 更新本地数据
+        favIds.forEach(id => {
+            const shot = allShots.find(s => s.id === id);
+            if (shot) shot.favorite = false;
+        });
+
+        totalFavorites = Math.max(0, totalFavorites - favIds.length);
+        updateSidebarCounts();
+
+        showToast(`已取消收藏 ${favIds.length} 个镜头`, 'success');
+        renderGrid();
+        updateSelectionBar();
+    } catch (err) {
+        showToast('批量取消收藏失败', 'error');
+    }
+}
+
+/**
+ * 批量删除选中的镜头
+ */
+async function deleteSelectedShots() {
+    if (selectedShots.size === 0) return;
+
+    const count = selectedShots.size;
+    showConfirm(
+        '删除镜头',
+        `确定要删除选中的 ${count} 个镜头吗？<br>此操作不可恢复。`,
+        '删除',
+        async () => {
+            try {
+                showToast(`正在删除 ${count} 个镜头…`);
+                const result = await API.deleteShots(Array.from(selectedShots));
+                if (result.success) {
+                    showToast(`已删除 ${result.deleted} 个镜头`, 'success');
+                    // 清空选择并刷新
+                    selectedShots.clear();
+                    selectMode = false;
+                    updateSelectionBar();
+                    await loadShots();
+                    updateVideoSourceTags();
+                    // 刷新项目列表数据
+                    const projData = await API.getProjects();
+                    allProjects = projData.projects || [];
+                } else {
+                    showToast('删除失败', 'error');
+                }
+            } catch (err) {
+                showToast('删除镜头失败', 'error');
+            }
+        },
+        true
+    );
 }
 
 /**

@@ -238,33 +238,9 @@ function renderProjectDropdown() {
     html += '<div class="project-dropdown-divider"></div>';
     html += `<div class="project-dropdown-create" onclick="showCreateProjectModal()">＋ 新建项目</div>`;
 
-    // 设置区域：视频路径导入 + 视频管理
-    html += '<div class="project-dropdown-divider"></div>';
-    html += `
-        <div class="project-dropdown-settings">
-            <div class="dropdown-settings-section">
-                <div class="dropdown-settings-title">视频路径导入</div>
-                <div style="display:flex;gap:8px">
-                    <input type="text" id="videoPathInput" placeholder="输入本地视频路径" style="flex:1;height:32px;font-size:12px">
-                    <button class="btn-primary" onclick="analyzeFromPath()" style="height:32px;font-size:12px;padding:0 12px">分析</button>
-                </div>
-            </div>
-            <div class="dropdown-settings-section">
-                <div class="dropdown-settings-title">视频管理</div>
-                <div id="videoList">
-                    <p style="font-size:12px;color:var(--text-tertiary)">暂无视频</p>
-                </div>
-                <button class="btn-text hidden" style="color:var(--red);margin-top:4px;font-size:11px" id="clearVideosBtn" onclick="clearAllVideos()">清空全部视频</button>
-            </div>
-        </div>
-    `;
-
     dropdown.innerHTML = html;
     // 使用 body 作为容器（固定定位），避免被 sidebar overflow 裁剪
     document.body.appendChild(dropdown);
-
-    // 加载视频管理列表
-    loadVideoList();
 
     // 点击外部关闭
     setTimeout(() => {
@@ -446,14 +422,17 @@ async function loadVideoList() {
             API.getBgTaskStatus(),
         ]);
         const list = document.getElementById('videoList');
+        if (!list) return;
 
         if (!data.videos || data.videos.length === 0) {
             list.innerHTML = '<p style="font-size:13px;color:var(--text-tertiary)">暂无视频</p>';
-            document.getElementById('clearVideosBtn').classList.add('hidden');
+            const clearBtn = document.getElementById('clearVideosBtn');
+            if (clearBtn) clearBtn.classList.add('hidden');
             return;
         }
 
-        document.getElementById('clearVideosBtn').classList.remove('hidden');
+        const clearBtn2 = document.getElementById('clearVideosBtn');
+        if (clearBtn2) clearBtn2.classList.remove('hidden');
         list.innerHTML = data.videos.map(v => {
             // 判断当前视频是否正在拆分
             const isCurrentlySplitting = bgStatus.stage === 'splitting' &&
@@ -477,30 +456,54 @@ async function loadVideoList() {
 }
 
 /**
- * 删除单个视频
+ * 删除单个视频（带"保留已收藏片段"勾选项）
  */
 function deleteVideoItem(videoPath, filename) {
-    showConfirm(
-        '删除视频',
-        `确定要删除「${filename}」及其关联的所有镜头数据吗？`,
-        '删除',
-        async () => {
-            try {
-                const result = await API.deleteVideo(videoPath);
-                if (result.success) {
-                    showToast('视频已删除', 'success');
-                    // 刷新项目列表数据（更新 shot_count / video_count）
-                    const projData = await API.getProjects();
-                    allProjects = projData.projects || [];
-                    loadVideoList();
-                    await initProjectView();
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+        <div class="modal-box confirm-modal" style="width:420px">
+            <h3>删除视频</h3>
+            <p>确定要删除「${escapeHtml(filename)}」及其关联的镜头数据吗？</p>
+            <label class="modal-checkbox-row">
+                <input type="checkbox" id="keepFavoritesCheck" checked>
+                <span>保留已收藏的片段</span>
+                <span class="modal-checkbox-hint">（收藏片段将裁剪后移至"其他片段"）</span>
+            </label>
+            <div class="form-actions">
+                <button class="btn-secondary" onclick="this.closest('.modal-overlay').remove()">取消</button>
+                <button class="btn-danger" id="confirmDeleteVideoBtn">删除</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+    });
+
+    overlay.querySelector('#confirmDeleteVideoBtn').addEventListener('click', async () => {
+        const keepFavorites = overlay.querySelector('#keepFavoritesCheck').checked;
+        overlay.remove();
+
+        try {
+            const result = await API.deleteVideo(videoPath, keepFavorites);
+            if (result.success) {
+                let msg = '视频已删除';
+                if (result.favorites_kept > 0) {
+                    msg += `，已保留 ${result.favorites_kept} 个收藏片段`;
                 }
-            } catch (err) {
-                showToast('删除视频失败', 'error');
+                showToast(msg, 'success');
+                // 刷新项目列表数据（更新 shot_count / video_count）
+                const projData = await API.getProjects();
+                allProjects = projData.projects || [];
+                loadVideoList();
+                await initProjectView();
             }
-        },
-        true
-    );
+        } catch (err) {
+            showToast('删除视频失败', 'error');
+        }
+    });
 }
 
 /**
@@ -509,15 +512,15 @@ function deleteVideoItem(videoPath, filename) {
 function clearAllVideos() {
     showConfirm(
         '清空所有视频',
-        '确定要清空当前项目的全部视频吗？已收藏的镜头会保留。',
+        '确定要清空当前项目的全部视频吗？<br>已收藏的孤儿片段会保留在"其他片段"中。',
         '清空全部',
         async () => {
             try {
                 const result = await API.clearVideos();
                 if (result.success) {
                     let msg = '已清空所有视频';
-                    if (result.favorites_kept > 0) {
-                        msg += `，已保留 ${result.favorites_kept} 个收藏镜头`;
+                    if (result.orphan_kept > 0) {
+                        msg += `，已保留 ${result.orphan_kept} 个孤儿片段`;
                     }
                     showToast(msg, 'success');
                     // 刷新项目列表数据（更新 shot_count / video_count）

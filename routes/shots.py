@@ -3,6 +3,7 @@ import os
 import cv2
 import asyncio
 import logging
+from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
@@ -12,6 +13,8 @@ from models.schemas import (
     SaveFrameRequest,
     SaveCustomFrameRequest,
     MergeShotsRequest,
+    SplitShotRequest,
+    BatchDeleteShotsRequest,
 )
 from services.project_manager import (
     get_active_project_id,
@@ -22,7 +25,7 @@ from services.project_manager import (
 )
 
 logger = logging.getLogger(__name__)
-from services.scene_detect import extract_frame, save_frame_jpeg, _video_hash, _frame_to_timecode, _frame_to_display_timecode
+from services.scene_detect import extract_frame, save_frame_jpeg, save_thumbnail, _video_hash, _frame_to_timecode, _frame_to_display_timecode
 from services.face_detect import detect_face_info, detect_face_info_multi_frame, get_effective_region_cached
 from services.shot_type_detect import classify_shot_type, classify_shot_label
 
@@ -34,6 +37,36 @@ def _get_active_project_or_fail() -> str:
     if not pid:
         raise HTTPException(status_code=400, detail="没有活跃项目")
     return pid
+
+
+def _apply_favorites_to_shots(shots: list, favorites: list):
+    """
+    根据 favorites 列表动态给 shots 标记 favorite 字段。
+    匹配规则：source_video 相同 + shot 中点落在 favorite 时间范围内。
+    对于 __orphan__ 类型的 shot，直接保留其已有的 favorite 标记。
+    """
+    if not favorites:
+        # 没有 favorites → 清除所有非孤儿 shot 的 favorite 标记
+        for shot in shots:
+            if shot.get("source_video") != "__orphan__":
+                shot["favorite"] = False
+        return
+
+    for shot in shots:
+        # 孤儿 shot 保持自身的 favorite 状态不变
+        if shot.get("source_video") == "__orphan__":
+            continue
+
+        shot_mid = (shot.get("start_time", 0) + shot.get("end_time", 0)) / 2
+        shot_src = shot.get("source_video", "")
+        matched = False
+        for fav in favorites:
+            if fav.get("source_video") != shot_src:
+                continue
+            if fav.get("start_time", 0) <= shot_mid <= fav.get("end_time", 0):
+                matched = True
+                break
+        shot["favorite"] = matched
 
 
 @router.get("/shots")
@@ -52,7 +85,25 @@ async def get_shots(
     if not project_data:
         return {"shots": [], "total": 0}
 
+    # ★ 数据迁移：老项目没有 favorites 字段时，从 shot.favorite 属性中提取
+    if "favorites" not in project_data:
+        favorites = []
+        for shot in project_data.get("shots", []):
+            if shot.get("favorite"):
+                favorites.append({
+                    "source_video": shot.get("source_video", ""),
+                    "start_time": shot.get("start_time", 0),
+                    "end_time": shot.get("end_time", 0),
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+        project_data["favorites"] = favorites
+        save_project_data(project_id, project_data)
+
     shots = list(project_data.get("shots", []))
+
+    # ★ 动态匹配 favorites → 给 shot 标记 favorite
+    favorites = project_data.get("favorites", [])
+    _apply_favorites_to_shots(shots, favorites)
 
     # 筛选 - 有人
     if has_person:
@@ -138,6 +189,43 @@ async def get_shots(
     }
 
 
+def _update_cover_frame(shot: dict, best_frame_num: int, video_path: str, project_id: str):
+    """
+    根据最优帧号更新镜头封面 — 当最优帧不是原 mid_frame 时，
+    重新提取该帧并覆盖封面 JPEG。
+
+    Args:
+        shot: 镜头字典
+        best_frame_num: 最优帧帧号
+        video_path: 视频文件路径
+        project_id: 项目 ID
+    """
+    if best_frame_num is None:
+        return
+
+    old_mid = shot.get("mid_frame")
+    if best_frame_num == old_mid:
+        return  # 最优帧就是原来的 mid_frame，无需更新
+
+    # 提取新帧
+    new_frame = extract_frame(video_path, best_frame_num)
+    if new_frame is None:
+        return
+
+    # 更新 mid_frame
+    shot["mid_frame"] = best_frame_num
+
+    # 覆盖封面 JPEG（使用缩略图格式，与 build_shots_fast 一致）
+    proj_dir = get_project_dir(project_id)
+    frames_dir = os.path.join(proj_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    frame_file = shot.get("frame_file", "")
+    if frame_file:
+        frame_path = os.path.join(frames_dir, frame_file)
+        save_thumbnail(new_frame, frame_path)
+        logger.info(f"封面已更新: {shot['id']} → 最优帧 F{best_frame_num}")
+
+
 @router.post("/detect_faces")
 async def detect_faces_on_demand():
     """
@@ -191,16 +279,18 @@ async def detect_faces_on_demand():
             )
             shot["has_person"] = bool(face_info["has_person"])
             shot["face_ratio"] = float(face_info["face_ratio"])
-            shot["person_ratio"] = float(face_info.get("person_ratio", 0.0))
             shot["good_composition"] = bool(face_info["good_composition"])
             shot["face_count"] = int(face_info.get("face_count", 0))
-            shot["person_count"] = int(face_info.get("person_count", 0))
             shot["per_frame_debug"] = face_info.get("per_frame", {})
             # ★ 补写构图安全性字段（裁头/安全区/黑边）
             shot["face_cropped"] = bool(face_info.get("face_cropped", False))
             shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
             shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
             shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
+
+            # ★ 根据最优帧更新封面（推镜头等场景，选最佳帧作为封面）
+            best_fn = face_info.get("best_frame_num")
+            _update_cover_frame(shot, best_fn, vpath, project_id)
 
             # ★ 构图瑕疵标记（不影响分类，仅供前端展示）
             issues = []
@@ -286,16 +376,19 @@ async def detect_shot_types():
                 )
                 shot["has_person"] = bool(face_info["has_person"])
                 shot["face_ratio"] = float(face_info["face_ratio"])
-                shot["person_ratio"] = float(face_info.get("person_ratio", 0.0))
                 shot["good_composition"] = bool(face_info["good_composition"])
                 shot["face_count"] = int(face_info.get("face_count", 0))
-                shot["person_count"] = int(face_info.get("person_count", 0))
                 shot["per_frame_debug"] = face_info.get("per_frame", {})
                 # ★ 补写构图安全性字段（裁头/安全区/黑边）
                 shot["face_cropped"] = bool(face_info.get("face_cropped", False))
                 shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
                 shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
                 shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
+
+                # ★ 根据最优帧更新封面
+                best_fn = face_info.get("best_frame_num")
+                _update_cover_frame(shot, best_fn, vpath, project_id)
+
                 # ★ 构图瑕疵标记
                 issues = []
                 if shot["face_cropped"]:
@@ -401,7 +494,7 @@ async def _clip_single_shot(shot: dict, proj_dir: str):
 
 @router.post("/favorite")
 async def toggle_favorite(req: FavoriteRequest):
-    """切换镜头收藏状态 — 收藏时自动预裁剪独立 MP4"""
+    """切换镜头收藏状态 — 收藏时自动预裁剪独立 MP4，操作 favorites 独立数组"""
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
 
@@ -409,17 +502,68 @@ async def toggle_favorite(req: FavoriteRequest):
         raise HTTPException(status_code=404, detail="项目数据不存在")
 
     proj_dir = get_project_dir(project_id)
-    found = False
+
+    # 找到目标 shot
     target_shot = None
     for shot in project_data.get("shots", []):
         if shot["id"] == req.shot_id:
-            shot["favorite"] = req.favorite
             target_shot = shot
-            found = True
             break
 
-    if not found:
+    if not target_shot:
         raise HTTPException(status_code=404, detail="镜头不存在")
+
+    # 操作 favorites 数组
+    favorites = project_data.get("favorites", [])
+
+    if req.favorite:
+        # 添加收藏记录（去重：检查是否已存在相同的 source_video + 时间范围）
+        src = target_shot.get("source_video", "")
+        start_t = target_shot.get("start_time", 0)
+        end_t = target_shot.get("end_time", 0)
+
+        already_exists = any(
+            f.get("source_video") == src
+            and abs(f.get("start_time", 0) - start_t) < 0.05
+            and abs(f.get("end_time", 0) - end_t) < 0.05
+            for f in favorites
+        )
+        if not already_exists:
+            favorites.append({
+                "source_video": src,
+                "start_time": start_t,
+                "end_time": end_t,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+    else:
+        # 移除收藏记录
+        src = target_shot.get("source_video", "")
+        shot_mid = (target_shot.get("start_time", 0) + target_shot.get("end_time", 0)) / 2
+
+        # 对于 __orphan__ shot，直接设置其 favorite 标记为 false（不需要操作 favorites）
+        if src == "__orphan__":
+            target_shot["favorite"] = False
+            project_data["favorites"] = favorites
+            save_project_data(project_id, project_data)
+            return {
+                "success": True,
+                "favorite": False,
+                "clip_file": target_shot.get("clip_file", ""),
+            }
+
+        # 正常 shot：从 favorites 中移除匹配记录
+        new_favorites = []
+        for f in favorites:
+            if f.get("source_video") != src:
+                new_favorites.append(f)
+                continue
+            # 时间范围匹配：shot 中点落在 favorite 范围内
+            if f.get("start_time", 0) <= shot_mid <= f.get("end_time", 0):
+                continue  # 移除此条
+            new_favorites.append(f)
+        favorites = new_favorites
+
+    project_data["favorites"] = favorites
 
     # ★ 收藏时，如果源视频存在且没有 clip_file，立即预裁剪
     clip_ready = False
@@ -668,16 +812,60 @@ async def merge_shots(req: MergeShotsRequest):
 
     # 提取新的中间帧
     frame = extract_frame(video_path, new_mid_frame)
-    has_person = shot_a.get("has_person", False) or shot_b.get("has_person", False)
-    face_ratio = max(shot_a.get("face_ratio", 0), shot_b.get("face_ratio", 0))
-    good_composition = shot_a.get("good_composition", False) or shot_b.get("good_composition", False)
     motion_score = max(shot_a.get("motion_score", 0), shot_b.get("motion_score", 0))
 
     if frame is not None:
         proj_dir = get_project_dir(project_id)
         frames_dir = os.path.join(proj_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
-        save_frame_jpeg(frame, os.path.join(frames_dir, frame_file))
+        save_thumbnail(frame, os.path.join(frames_dir, frame_file))
+
+    # ── 对合并后的镜头做独立的人脸检测 + 景别分类 ──
+    effective_region = get_effective_region_cached(video_path)
+    face_info = detect_face_info_multi_frame(
+        video_path=video_path,
+        start_frame=new_start_frame,
+        end_frame=new_end_frame,
+        sample_count=3,
+        effective_region=effective_region,
+    )
+
+    # ★ 根据最优帧更新封面
+    best_fn = face_info.get("best_frame_num")
+    if best_fn is not None and best_fn != new_mid_frame:
+        best_frame_img = extract_frame(video_path, best_fn)
+        if best_frame_img is not None:
+            new_mid_frame = best_fn
+            if not proj_dir:
+                proj_dir = get_project_dir(project_id)
+            frames_dir = os.path.join(proj_dir, "frames")
+            os.makedirs(frames_dir, exist_ok=True)
+            save_thumbnail(best_frame_img, os.path.join(frames_dir, frame_file))
+
+    merged_has_person = bool(face_info["has_person"])
+    merged_face_ratio = float(face_info["face_ratio"])
+    merged_good_composition = bool(face_info["good_composition"])
+    merged_face_count = int(face_info.get("face_count", 0))
+    merged_face_cropped = bool(face_info.get("face_cropped", False))
+    merged_face_in_safe_zone = bool(face_info.get("face_in_safe_zone", True))
+    merged_head_margin_ratio = float(face_info.get("head_margin_ratio", 1.0))
+    merged_has_black_bars = bool(face_info.get("has_black_bars", False))
+
+    # 构图瑕疵标记
+    issues = []
+    if merged_face_cropped:
+        issues.append("裁头")
+    if not merged_face_in_safe_zone:
+        issues.append("贴边")
+    merged_composition_issue = "/".join(issues)
+
+    # 景别分类
+    merged_shot_type = classify_shot_label(
+        face_count=merged_face_count,
+        face_ratio=merged_face_ratio,
+        face_cropped=merged_face_cropped,
+        face_in_safe_zone=merged_face_in_safe_zone,
+    )
 
     # 构建合并后的镜头
     merged_shot = {
@@ -691,15 +879,20 @@ async def merge_shots(req: MergeShotsRequest):
         "start_time": new_start_time,
         "end_time": new_end_time,
         "duration": new_duration,
-        "has_person": has_person,
-        "face_ratio": face_ratio,
-        "face_count": max(shot_a.get("face_count", 0), shot_b.get("face_count", 0)),
-        "person_ratio": max(shot_a.get("person_ratio", 0), shot_b.get("person_ratio", 0)),
-        "good_composition": good_composition,
+        "has_person": merged_has_person,
+        "face_ratio": merged_face_ratio,
+        "face_count": merged_face_count,
+        "good_composition": merged_good_composition,
         "motion_score": motion_score,
-        "shot_type": shot_a.get("shot_type", "") or shot_b.get("shot_type", ""),
-        "face_detected": shot_a.get("face_detected", False) and shot_b.get("face_detected", False),
-        "shot_type_detected": shot_a.get("shot_type_detected", False) and shot_b.get("shot_type_detected", False),
+        "shot_type": merged_shot_type,
+        "face_detected": True,
+        "shot_type_detected": True,
+        "face_cropped": merged_face_cropped,
+        "face_in_safe_zone": merged_face_in_safe_zone,
+        "head_margin_ratio": merged_head_margin_ratio,
+        "has_black_bars": merged_has_black_bars,
+        "composition_issue": merged_composition_issue,
+        "per_frame_debug": face_info.get("per_frame", {}),
         "favorite": shot_a.get("favorite", False) or shot_b.get("favorite", False),
         "saved": False,
         "frame_file": frame_file,
@@ -731,4 +924,294 @@ async def merge_shots(req: MergeShotsRequest):
         "success": True,
         "merged_shot": merged_shot,
         "removed_ids": removed_ids,
+    }
+
+
+@router.post("/split_shot")
+async def split_shot(req: SplitShotRequest):
+    """
+    拆分镜头 — 在指定时间点将一个镜头拆为前后两段。
+    与 merge_shots 对称的逆操作。
+    """
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+
+    if not project_data:
+        raise HTTPException(status_code=404, detail="项目数据不存在")
+
+    shots = project_data.get("shots", [])
+    fps_val = project_data.get("fps", 24)
+
+    # 找到原镜头
+    orig_shot = None
+    orig_idx = -1
+    for i, shot in enumerate(shots):
+        if shot["id"] == req.shot_id:
+            orig_shot = shot
+            orig_idx = i
+            break
+
+    if orig_shot is None:
+        raise HTTPException(status_code=404, detail="镜头不存在")
+
+    video_path = orig_shot.get("source_video", "")
+    if not video_path or not os.path.exists(video_path):
+        raise HTTPException(status_code=400, detail="源视频文件不存在，无法拆分")
+
+    split_time = req.split_time
+    orig_start = orig_shot["start_time"]
+    orig_end = orig_shot["end_time"]
+
+    # 校验拆分点在镜头范围内
+    min_gap = 2 / fps_val  # 至少 2 帧
+    if split_time <= orig_start + min_gap or split_time >= orig_end - min_gap:
+        raise HTTPException(status_code=400, detail="拆分点需在镜头范围内且距头尾至少2帧")
+
+    video_hash = _video_hash(video_path)
+    proj_dir = get_project_dir(project_id)
+    frames_dir = os.path.join(proj_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    # ── 构建镜头 A（前半段） ──
+    a_start_frame = orig_shot["start_frame"]
+    a_end_frame = int(split_time * fps_val)
+    a_mid_frame = (a_start_frame + a_end_frame) // 2
+    a_start_time = orig_start
+    a_end_time = round(split_time, 3)
+    a_duration = round(a_end_time - a_start_time, 3)
+    a_timecode = _frame_to_timecode(a_start_frame, fps_val)
+    a_timecode_display = _frame_to_display_timecode(a_start_frame, fps_val)
+    a_id = f"shot_{orig_idx:04d}_{video_hash}_{a_timecode}"
+    a_frame_file = f"{a_id}.jpg"
+
+    # 提取镜头 A 中间帧
+    frame_a = extract_frame(video_path, a_mid_frame)
+    if frame_a is not None:
+        save_frame_jpeg(frame_a, os.path.join(frames_dir, a_frame_file))
+
+    shot_a = {
+        "id": a_id,
+        "index": orig_idx,
+        "timecode": a_timecode,
+        "timecode_display": a_timecode_display,
+        "start_frame": a_start_frame,
+        "end_frame": a_end_frame,
+        "mid_frame": a_mid_frame,
+        "start_time": a_start_time,
+        "end_time": a_end_time,
+        "duration": a_duration,
+        "motion_score": orig_shot.get("motion_score", 0),
+        "favorite": False,
+        "saved": False,
+        "frame_file": a_frame_file,
+        "source_video": video_path,
+    }
+
+    # ── 构建镜头 B（后半段） ──
+    b_start_frame = a_end_frame
+    b_end_frame = orig_shot["end_frame"]
+    b_mid_frame = (b_start_frame + b_end_frame) // 2
+    b_start_time = round(split_time, 3)
+    b_end_time = orig_end
+    b_duration = round(b_end_time - b_start_time, 3)
+    b_timecode = _frame_to_timecode(b_start_frame, fps_val)
+    b_timecode_display = _frame_to_display_timecode(b_start_frame, fps_val)
+    b_id = f"shot_{orig_idx + 1:04d}_{video_hash}_{b_timecode}"
+    b_frame_file = f"{b_id}.jpg"
+
+    # 提取镜头 B 中间帧
+    frame_b = extract_frame(video_path, b_mid_frame)
+    if frame_b is not None:
+        save_frame_jpeg(frame_b, os.path.join(frames_dir, b_frame_file))
+
+    shot_b = {
+        "id": b_id,
+        "index": orig_idx + 1,
+        "timecode": b_timecode,
+        "timecode_display": b_timecode_display,
+        "start_frame": b_start_frame,
+        "end_frame": b_end_frame,
+        "mid_frame": b_mid_frame,
+        "start_time": b_start_time,
+        "end_time": b_end_time,
+        "duration": b_duration,
+        "motion_score": orig_shot.get("motion_score", 0),
+        "favorite": False,
+        "saved": False,
+        "frame_file": b_frame_file,
+        "source_video": video_path,
+    }
+
+    # ── 对拆分后的两个镜头分别做人脸检测 + 景别分类 ──
+    effective_region = get_effective_region_cached(video_path)
+
+    for new_shot in [shot_a, shot_b]:
+        face_info = detect_face_info_multi_frame(
+            video_path=video_path,
+            start_frame=new_shot["start_frame"],
+            end_frame=new_shot["end_frame"],
+            sample_count=3,
+            effective_region=effective_region,
+        )
+        new_shot["has_person"] = bool(face_info["has_person"])
+        new_shot["face_ratio"] = float(face_info["face_ratio"])
+        new_shot["good_composition"] = bool(face_info["good_composition"])
+        new_shot["face_count"] = int(face_info.get("face_count", 0))
+        new_shot["per_frame_debug"] = face_info.get("per_frame", {})
+        new_shot["face_cropped"] = bool(face_info.get("face_cropped", False))
+        new_shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
+        new_shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
+        new_shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
+
+        # ★ 根据最优帧更新封面
+        best_fn = face_info.get("best_frame_num")
+        _update_cover_frame(new_shot, best_fn, video_path, project_id)
+
+        # 构图瑕疵标记
+        issues = []
+        if new_shot["face_cropped"]:
+            issues.append("裁头")
+        if not new_shot["face_in_safe_zone"]:
+            issues.append("贴边")
+        new_shot["composition_issue"] = "/".join(issues)
+
+        # 景别分类
+        new_shot["shot_type"] = classify_shot_label(
+            face_count=new_shot["face_count"],
+            face_ratio=new_shot["face_ratio"],
+            face_cropped=new_shot["face_cropped"],
+            face_in_safe_zone=new_shot["face_in_safe_zone"],
+        )
+        new_shot["face_detected"] = True
+        new_shot["shot_type_detected"] = True
+
+    # ── 删除原镜头帧文件 ──
+    old_frame = os.path.join(frames_dir, orig_shot.get("frame_file", ""))
+    if os.path.exists(old_frame):
+        try:
+            os.remove(old_frame)
+        except OSError:
+            pass
+
+    # ── 删除原镜头的 clip 缓存 ──
+    shots_cache_dir = os.path.join(proj_dir, "shots")
+    if os.path.isdir(shots_cache_dir):
+        import glob
+        for cached_file in glob.glob(os.path.join(shots_cache_dir, f"{req.shot_id}*")):
+            try:
+                os.remove(cached_file)
+            except OSError:
+                pass
+
+    # ── 替换列表：移除原镜头，插入两个新镜头 ──
+    removed_id = orig_shot["id"]
+    shots.pop(orig_idx)
+    shots.insert(orig_idx, shot_b)
+    shots.insert(orig_idx, shot_a)
+
+    # 重排 index
+    for i, shot in enumerate(shots):
+        shot["index"] = i
+
+    project_data["shots"] = shots
+    save_project_data(project_id, project_data)
+    update_project_info(project_id, shot_count=len(shots))
+
+    # ★ 为返回数据标注源视频是否存在
+    shot_a["source_video_exists"] = os.path.exists(video_path)
+    shot_b["source_video_exists"] = os.path.exists(video_path)
+
+    return {
+        "success": True,
+        "shot_a": shot_a,
+        "shot_b": shot_b,
+        "removed_id": removed_id,
+    }
+
+
+@router.post("/shots/delete")
+async def batch_delete_shots(req: BatchDeleteShotsRequest):
+    """
+    批量删除镜头 — 从 shots 数组中移除指定镜头，清理帧/clip 文件。
+    如果被删镜头有 favorite 记录，同步从 favorites 中移除。
+    """
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+
+    if not project_data:
+        raise HTTPException(status_code=404, detail="项目数据不存在")
+
+    proj_dir = get_project_dir(project_id)
+    frames_dir = os.path.join(proj_dir, "frames")
+    saved_frames_dir = os.path.join(proj_dir, "saved_frames")
+    shots_dir = os.path.join(proj_dir, "shots")
+
+    delete_ids = set(req.shot_ids)
+    shots = project_data.get("shots", [])
+    favorites = project_data.get("favorites", [])
+
+    # 收集被删除的 shot 信息（用于清理 favorites）
+    deleted_shots = [s for s in shots if s["id"] in delete_ids]
+
+    # 清理文件
+    for shot in deleted_shots:
+        # 删除帧文件
+        frame_path = os.path.join(frames_dir, shot.get("frame_file", ""))
+        if os.path.exists(frame_path):
+            try:
+                os.remove(frame_path)
+            except OSError:
+                pass
+        # 删除 clip 文件
+        clip_file = shot.get("clip_file", "")
+        if clip_file:
+            clip_path = os.path.join(shots_dir, clip_file)
+            if os.path.exists(clip_path):
+                try:
+                    os.remove(clip_path)
+                except OSError:
+                    pass
+        # 删除保存的静帧
+        for suffix in ["_saved.jpg", f"_custom_{shot.get('mid_frame', 0)}.jpg"]:
+            saved_path = os.path.join(saved_frames_dir, f"{shot['id']}{suffix}")
+            if os.path.exists(saved_path):
+                try:
+                    os.remove(saved_path)
+                except OSError:
+                    pass
+
+    # 从 favorites 中移除对应记录
+    new_favorites = []
+    for fav in favorites:
+        fav_src = fav.get("source_video", "")
+        fav_start = fav.get("start_time", 0)
+        fav_end = fav.get("end_time", 0)
+
+        # 检查是否有被删的 shot 匹配此 favorite
+        matched_deleted = False
+        for ds in deleted_shots:
+            ds_src = ds.get("source_video", "")
+            if ds_src != fav_src:
+                continue
+            ds_mid = (ds.get("start_time", 0) + ds.get("end_time", 0)) / 2
+            if fav_start <= ds_mid <= fav_end:
+                matched_deleted = True
+                break
+        if not matched_deleted:
+            new_favorites.append(fav)
+
+    # 更新 shots 和 favorites
+    remaining_shots = [s for s in shots if s["id"] not in delete_ids]
+    for i, shot in enumerate(remaining_shots):
+        shot["index"] = i
+
+    project_data["shots"] = remaining_shots
+    project_data["favorites"] = new_favorites
+    save_project_data(project_id, project_data)
+    update_project_info(project_id, shot_count=len(remaining_shots))
+
+    return {
+        "success": True,
+        "deleted": len(deleted_shots),
+        "remaining": len(remaining_shots),
     }

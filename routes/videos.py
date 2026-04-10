@@ -7,6 +7,7 @@ import logging
 import threading
 import asyncio
 import numpy as np
+from datetime import datetime
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query
 from typing import Optional
 
@@ -30,7 +31,6 @@ from services.scene_detect import (
     build_shots_from_scenes,
     build_shots_fast,
     save_thumbnail,
-    select_representative_frame,
 )
 from services.face_detect import (
     detect_face_info_from_frames,
@@ -197,7 +197,7 @@ def _background_analysis(project_id: str, video_paths: list):
     """
     后台分析任务 — 单遍扫描（支持断点续传）：
     每个镜头只读一次帧（25%, 50%, 75%），同时完成：
-      ① 快速预筛（YuNet 人脸 + HOG 人体兜底）
+      ① 快速预筛（YuNet 人脸检测）
       ② 深度人像检测 + 人数统计 + 景别分类 + 智能选帧
       ③ 动态值计算（灰度帧差）
     断点续传：跳过已完成分析的镜头（face_detected=True），避免重复计算。
@@ -295,7 +295,7 @@ def _background_analysis(project_id: str, video_paths: list):
                                           analyzed_count=processed, total_count=total_shots)
                         continue
 
-                    # ── ① 快速预筛（YuNet + HOG 兜底）──
+                    # ── ① 快速预筛（YuNet 人脸检测）──
                     triage = quick_triage_from_frames(sampled_frames)
 
                     if triage["worth"]:
@@ -307,10 +307,8 @@ def _background_analysis(project_id: str, video_paths: list):
 
                         shot["has_person"] = bool(face_result["has_person"])
                         shot["face_ratio"] = float(face_result["face_ratio"])
-                        shot["person_ratio"] = float(face_result.get("person_ratio", 0.0))
                         shot["good_composition"] = bool(face_result["good_composition"])
                         shot["face_count"] = int(face_result.get("face_count", 0))
-                        shot["person_count"] = int(face_result.get("person_count", 0))
                         shot["face_detected"] = True
                         # ★ 新增构图信息字段
                         shot["face_cropped"] = bool(face_result.get("face_cropped", False))
@@ -327,25 +325,29 @@ def _background_analysis(project_id: str, video_paths: list):
                         )
                         shot["shot_type_detected"] = True
 
-                        # 智能选帧：根据景别替换封面
-                        per_frame = face_result.get("per_frame", {})
-                        if per_frame and shot["shot_type"] in ("近景人像", "黄金人像", "远景人像"):
-                            best_fn, best_frame = select_representative_frame(
-                                cap,
-                                start_f,
-                                end_f,
-                                shot["shot_type"],
-                                per_frame,
-                            )
-                            if best_frame is not None and best_fn != start_f:
+                        # 构图瑕疵标记
+                        issues = []
+                        if shot.get("face_cropped"):
+                            issues.append("裁头")
+                        if not shot.get("face_in_safe_zone", True):
+                            issues.append("贴边")
+                        shot["composition_issue"] = "/".join(issues)
+
+                        # per_frame 调试信息
+                        shot["per_frame_debug"] = face_result.get("per_frame", {})
+
+                        # 智能选帧：使用 best_frame_num 替换封面
+                        best_fn = face_result.get("best_frame_num")
+                        if best_fn is not None and best_fn != start_f:
+                            best_frame_img = sampled_frames.get(best_fn)
+                            if best_frame_img is not None:
                                 frame_path = os.path.join(frames_dir, shot.get("frame_file", ""))
-                                save_thumbnail(best_frame, frame_path)
-                                shot["cover_frame"] = best_fn
+                                save_thumbnail(best_frame_img, frame_path)
+                                shot["mid_frame"] = best_fn
                     else:
                         # 预筛未通过 → 空镜
                         shot["face_count"] = 0
                         shot["has_person"] = False
-                        shot["person_count"] = 0
                         shot["shot_type"] = "空镜"
                         shot["face_detected"] = True
                         shot["shot_type_detected"] = True
@@ -429,6 +431,14 @@ def _batch_background_task(project_id: str, video_paths: list, threshold: int):
                 }
 
                 existing_shots = project_data.get("shots", [])
+                index_offset = len(existing_shots)
+
+                # ★ 去重：如果 existing_shots 中有来自同一视频源的孤儿收藏 shots，先移除它们
+                existing_shots = [
+                    s for s in existing_shots
+                    if not (s.get("source_video") == vpath or
+                            (s.get("source_video") == "__orphan__" and s.get("original_source") == vpath))
+                ]
                 index_offset = len(existing_shots)
 
                 # 帧输出目录
@@ -753,7 +763,7 @@ async def analyze_append(req: AnalyzeAppendRequest):
     }
 
 
-def _reanalyze_background_task(project_id: str, video_paths: list, threshold: int, favorite_ranges: list):
+def _reanalyze_background_task(project_id: str, video_paths: list, threshold: int, favorite_ranges: list, orphan_shots: list):
     """
     后台重新分析任务 — 用新灵敏度重新切分所有视频的镜头。
     在后台线程中执行，避免阻塞 FastAPI 事件循环。
@@ -824,23 +834,18 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
                               current_video="", split_queue=0, split_done=0)
             return
 
-        # 恢复收藏状态：新 shot 的时间范围与旧收藏 shot 有重叠 → 标记为收藏
-        for new_shot in all_new_shots:
-            new_start = new_shot.get("start_time", 0)
-            new_end = new_shot.get("end_time", 0)
-            new_source = new_shot.get("source_video")
-            new_mid = (new_start + new_end) / 2
+        # ★ 不再手动标记 shot.favorite — 由 get_shots 根据 favorites 数组动态匹配
+        # favorites 数组不在重分析时修改，保持用户原有的收藏记录
 
-            for fav in favorite_ranges:
-                if fav["source_video"] != new_source:
-                    continue
-                if fav["start_time"] <= new_mid <= fav["end_time"]:
-                    new_shot["favorite"] = True
-                    break
+        # ★ 保留孤儿 shots（source_video == "__orphan__"），它们不受重分析影响
+        # 重新排 index
+        final_shots = all_new_shots + orphan_shots
+        for i, s in enumerate(final_shots):
+            s["index"] = i
 
         # 更新项目数据
         project_data = load_project_data(project_id) or {}
-        project_data["shots"] = all_new_shots
+        project_data["shots"] = final_shots
         project_data["fps"] = latest_fps
         project_data["total_frames"] = latest_total_frames
         save_project_data(project_id, project_data)
@@ -848,10 +853,10 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
         # 更新项目索引
         update_project_info(
             project_id,
-            shot_count=len(all_new_shots),
+            shot_count=len(final_shots),
         )
 
-        logger.info(f"重新分析拆分完成: {len(all_new_shots)} 个镜头")
+        logger.info(f"重新分析拆分完成: {len(all_new_shots)} 个镜头 + {len(orphan_shots)} 个孤儿镜头")
 
         # 全部拆分完成，进入深度分析阶段
         if not _cancel_flag.is_set():
@@ -866,14 +871,14 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
                           current_video="", split_queue=0, split_done=0)
 
 
-def _start_reanalyze_background(project_id: str, video_paths: list, threshold: int, favorite_ranges: list):
+def _start_reanalyze_background(project_id: str, video_paths: list, threshold: int, favorite_ranges: list, orphan_shots: list):
     """启动后台重新分析线程（先停止旧任务）"""
     global _bg_task_thread
     _stop_running_bg_task()
     _cancel_flag.clear()
     t = threading.Thread(
         target=_reanalyze_background_task,
-        args=(project_id, video_paths, threshold, favorite_ranges),
+        args=(project_id, video_paths, threshold, favorite_ranges, orphan_shots),
         daemon=True,
     )
     _bg_task_thread = t
@@ -899,19 +904,17 @@ async def reanalyze_all(req: ReanalyzeRequest):
 
     threshold = req.threshold or DEFAULT_THRESHOLD
 
-    # 保存旧镜头的收藏状态（用时间范围做匹配，传给后台线程）
-    old_shots = project_data.get("shots", [])
-    favorite_ranges = []
-    for shot in old_shots:
-        if shot.get("favorite"):
-            favorite_ranges.append({
-                "source_video": shot.get("source_video"),
-                "start_time": shot.get("start_time", 0),
-                "end_time": shot.get("end_time", 0),
-            })
+    # ★ 从独立的 favorites 数组读取收藏信息（传给后台线程用于恢复标记）
+    favorite_ranges = list(project_data.get("favorites", []))
+
+    # ★ 保留不在 video_paths 中的孤儿 shots（source_video == "__orphan__"）
+    orphan_shots = [
+        s for s in project_data.get("shots", [])
+        if s.get("source_video") == "__orphan__"
+    ]
 
     # ★ 启动后台线程处理重切分 + 深度分析，接口立即返回
-    _start_reanalyze_background(project_id, video_paths, threshold, favorite_ranges)
+    _start_reanalyze_background(project_id, video_paths, threshold, favorite_ranges, orphan_shots)
 
     return {
         "success": True,
@@ -1013,14 +1016,49 @@ async def get_videos():
         if os.path.exists(vpath):
             size_mb = round(os.path.getsize(vpath) / (1024 * 1024), 1)
 
+        # 获取视频时长（秒）
+        duration_sec = 0
+        try:
+            cap = cv2.VideoCapture(vpath)
+            if cap.isOpened():
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                fps_val = cap.get(cv2.CAP_PROP_FPS)
+                if fps_val > 0:
+                    duration_sec = round(frame_count / fps_val, 2)
+                cap.release()
+        except Exception:
+            pass
+
         videos.append({
             "path": vpath,
             "filename": os.path.basename(vpath),
             "size_mb": size_mb,
             "shot_count": shot_count,
+            "duration_sec": duration_sec,
         })
 
     return {"videos": videos}
+
+
+def _migrate_favorites(project_data: dict) -> bool:
+    """
+    数据迁移：如果项目没有 favorites 字段，从 shots 中提取 favorite=True 的记录。
+    Returns True 如果做了迁移（需要保存）。
+    """
+    if "favorites" in project_data:
+        return False
+
+    favorites = []
+    for shot in project_data.get("shots", []):
+        if shot.get("favorite"):
+            favorites.append({
+                "source_video": shot.get("source_video", ""),
+                "start_time": shot.get("start_time", 0),
+                "end_time": shot.get("end_time", 0),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+    project_data["favorites"] = favorites
+    return True
 
 
 async def _pre_clip_favorite_shots(shots: list, proj_dir: str):
@@ -1089,12 +1127,20 @@ async def _pre_clip_favorite_shots(shots: list, proj_dir: str):
 
 @router.post("/videos/delete")
 async def delete_video(req: VideoDeleteRequest):
-    """删除单个视频及其关联的非收藏镜头数据、帧文件和上传文件，保留已收藏的镜头"""
+    """
+    删除单个视频及其关联的镜头数据。
+    keep_favorites=True（默认）：收藏镜头先裁剪 clip，然后作为孤儿 shot（source_video=__orphan__）保留。
+    keep_favorites=False：全部清除，同时清除 favorites 中对应记录。
+    """
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
 
     if not project_data:
         raise HTTPException(status_code=404, detail="项目数据不存在")
+
+    # ★ 数据迁移
+    if _migrate_favorites(project_data):
+        save_project_data(project_id, project_data)
 
     video_path = req.video_path
     video_paths = project_data.get("video_paths", [])
@@ -1106,21 +1152,27 @@ async def delete_video(req: VideoDeleteRequest):
     frames_dir = os.path.join(proj_dir, "frames")
     saved_frames_dir = os.path.join(proj_dir, "saved_frames")
 
-    # ★ 在删除源视频前，先为该视频的收藏镜头预裁剪独立 MP4
-    fav_shots_to_clip = [
-        s for s in project_data.get("shots", [])
-        if s.get("source_video") == video_path and s.get("favorite")
-    ]
-    if fav_shots_to_clip:
-        await _pre_clip_favorite_shots(fav_shots_to_clip, proj_dir)
+    favorites = project_data.get("favorites", [])
 
-    # 分离收藏/非收藏镜头
+    if req.keep_favorites:
+        # ★ 保留收藏镜头：先为收藏镜头预裁剪 clip，然后转为孤儿 shot
+        fav_shots_to_clip = [
+            s for s in project_data.get("shots", [])
+            if s.get("source_video") == video_path and s.get("favorite")
+        ]
+        if fav_shots_to_clip:
+            await _pre_clip_favorite_shots(fav_shots_to_clip, proj_dir)
+
+    # 分离镜头
     remaining_shots = []
     favorites_kept = 0
     for shot in project_data.get("shots", []):
         if shot.get("source_video") == video_path:
-            if shot.get("favorite"):
-                # ★ 已收藏的镜头保留，不删除帧文件
+            if req.keep_favorites and shot.get("favorite"):
+                # ★ 转为孤儿 shot：修改 source_video 为 __orphan__，保留 clip_file
+                shot["original_source"] = video_path
+                shot["original_source_name"] = os.path.basename(video_path)
+                shot["source_video"] = "__orphan__"
                 remaining_shots.append(shot)
                 favorites_kept += 1
             else:
@@ -1136,6 +1188,15 @@ async def delete_video(req: VideoDeleteRequest):
         else:
             remaining_shots.append(shot)
 
+    # ★ 清除 favorites 中对应视频的记录
+    if not req.keep_favorites:
+        # 不保留 → 清除该视频的所有 favorites
+        favorites = [f for f in favorites if f.get("source_video") != video_path]
+    else:
+        # 保留 → 也从 favorites 中移除该视频的记录（因为已转为孤儿 shot，
+        # 孤儿 shot 的 favorite 状态由自身属性维护，不再依赖 favorites 数组匹配）
+        favorites = [f for f in favorites if f.get("source_video") != video_path]
+
     # 重排 index
     for i, shot in enumerate(remaining_shots):
         shot["index"] = i
@@ -1143,10 +1204,11 @@ async def delete_video(req: VideoDeleteRequest):
     # 从视频列表中移除
     video_paths.remove(video_path)
 
-    # 更新 video_path 指向
+    # 更新项目数据
     project_data["video_paths"] = video_paths
     project_data["video_path"] = video_paths[-1] if video_paths else None
     project_data["shots"] = remaining_shots
+    project_data["favorites"] = favorites
     save_project_data(project_id, project_data)
 
     # 更新索引
@@ -1174,19 +1236,18 @@ async def delete_video(req: VideoDeleteRequest):
 
 @router.post("/videos/clear")
 async def clear_videos():
-    """清空项目所有视频和非收藏镜头数据，保留已收藏的镜头"""
+    """清空项目所有视频和镜头数据（孤儿 shots 保留）"""
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
 
     if not project_data:
         return {"success": True, "favorites_kept": 0}
 
-    proj_dir = get_project_dir(project_id)
+    # ★ 数据迁移
+    if _migrate_favorites(project_data):
+        save_project_data(project_id, project_data)
 
-    # ★ 在删除源视频前，先为所有收藏镜头预裁剪独立 MP4
-    fav_shots_to_clip = [s for s in project_data.get("shots", []) if s.get("favorite")]
-    if fav_shots_to_clip:
-        await _pre_clip_favorite_shots(fav_shots_to_clip, proj_dir)
+    proj_dir = get_project_dir(project_id)
 
     # 删除 uploads 中的关联视频文件
     uploads_norm = os.path.normpath(os.path.abspath(UPLOADS_DIR)) + os.sep
@@ -1200,39 +1261,39 @@ async def clear_videos():
     frames_dir = os.path.join(proj_dir, "frames")
     saved_frames_dir = os.path.join(proj_dir, "saved_frames")
 
-    # ★ 收集已收藏镜头及其帧文件和裁剪文件路径（需要保留）
-    favorite_shots = []
+    # ★ 保留孤儿 shots 和它们的文件
+    orphan_shots = []
     keep_frame_files = set()
-    keep_saved_files = set()
     keep_clip_files = set()
 
     for shot in project_data.get("shots", []):
-        if shot.get("favorite"):
-            favorite_shots.append(shot)
-            # 记录需要保留的帧文件名
+        if shot.get("source_video") == "__orphan__":
+            orphan_shots.append(shot)
             ff = shot.get("frame_file", "")
             if ff:
                 keep_frame_files.add(ff)
-            # 记录需要保留的已保存静帧
-            for suffix in ["_saved.jpg", f"_custom_{shot.get('mid_frame', 0)}.jpg"]:
-                keep_saved_files.add(f"{shot['id']}{suffix}")
-            # 记录需要保留的预裁剪 clip 文件
             cf = shot.get("clip_file", "")
             if cf:
                 keep_clip_files.add(cf)
 
     # 清理帧目录中 **非保留** 的文件
-    for sub, keep_set in [("frames", keep_frame_files), ("saved_frames", keep_saved_files)]:
-        sub_dir = os.path.join(proj_dir, sub)
-        if os.path.exists(sub_dir):
-            for fname in os.listdir(sub_dir):
-                if fname not in keep_set:
-                    try:
-                        os.remove(os.path.join(sub_dir, fname))
-                    except Exception:
-                        pass
+    if os.path.exists(frames_dir):
+        for fname in os.listdir(frames_dir):
+            if fname not in keep_frame_files:
+                try:
+                    os.remove(os.path.join(frames_dir, fname))
+                except Exception:
+                    pass
 
-    # 清理 shots 缓存目录中 **非保留** 的文件（保留收藏镜头的 clip 文件）
+    # 清理 saved_frames 目录
+    if os.path.exists(saved_frames_dir):
+        for fname in os.listdir(saved_frames_dir):
+            try:
+                os.remove(os.path.join(saved_frames_dir, fname))
+            except Exception:
+                pass
+
+    # 清理 shots 缓存目录中 **非保留** 的文件
     shots_cache_dir = os.path.join(proj_dir, "shots")
     if os.path.exists(shots_cache_dir):
         for fname in os.listdir(shots_cache_dir):
@@ -1243,18 +1304,26 @@ async def clear_videos():
                     pass
 
     # 重排保留镜头的 index
-    for i, shot in enumerate(favorite_shots):
+    for i, shot in enumerate(orphan_shots):
         shot["index"] = i
 
-    # 更新项目数据（保留收藏镜头）
+    # ★ 清除所有非孤儿相关的 favorites（即清除有 video_paths 来源的 favorites）
+    video_paths_set = set(project_data.get("video_paths", []))
+    remaining_favorites = [
+        f for f in project_data.get("favorites", [])
+        if f.get("source_video") not in video_paths_set
+    ]
+
+    # 更新项目数据
     project_data["video_path"] = None
     project_data["video_paths"] = []
-    project_data["shots"] = favorite_shots
-    project_data["fps"] = project_data.get("fps", 0) if favorite_shots else 0
+    project_data["shots"] = orphan_shots
+    project_data["favorites"] = remaining_favorites
+    project_data["fps"] = project_data.get("fps", 0) if orphan_shots else 0
     project_data["total_frames"] = 0
     save_project_data(project_id, project_data)
 
     # 更新索引
-    update_project_info(project_id, shot_count=len(favorite_shots), video_count=0)
+    update_project_info(project_id, shot_count=len(orphan_shots), video_count=0)
 
-    return {"success": True, "favorites_kept": len(favorite_shots)}
+    return {"success": True, "orphan_kept": len(orphan_shots)}

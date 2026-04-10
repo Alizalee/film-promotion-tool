@@ -1,4 +1,4 @@
-"""人脸 + 人体检测服务 — YuNet 人脸 + HOG 人体 双维度检测，多帧采样"""
+"""人脸检测服务 — YuNet 人脸检测，多帧采样"""
 import os
 import cv2
 import logging
@@ -11,9 +11,9 @@ from models.constants import (
     YUNET_TRIAGE_SCORE,
     MODELS_DIR,
     MIN_FACE_RATIO,
-    MIN_PERSON_RATIO,
     FACE_RATIO_TIER_LOW,
     FACE_RATIO_TIER_HIGH,
+    FACE_RATIO_DISTANT_MIN,
     FACE_RELATIVE_THRESHOLD,
     BLACK_BAR_BRIGHTNESS_THRESHOLD,
     BLACK_BAR_MIN_RATIO,
@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 # ─── 全局加载模型（避免每次调用重复加载） ───
 
 _yunet_detector = None
-_hog_detector = None
 
 
 def _load_yunet(input_w: int = 320, input_h: int = 320):
@@ -93,15 +92,6 @@ def _download_yunet_model(save_path: str):
         logger.warning(f"YuNet 模型下载失败: {e}")
 
 
-def _load_hog_detector():
-    """加载 HOG 人体检测器（OpenCV 内置，零依赖）"""
-    global _hog_detector
-    if _hog_detector is None:
-        _hog_detector = cv2.HOGDescriptor()
-        _hog_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    return _hog_detector
-
-
 def _detect_faces_yunet(frame: np.ndarray, score_threshold: float = None) -> list:
     """
     使用 YuNet 检测人脸，返回 [(x, y, w, h, score), ...]。
@@ -146,59 +136,6 @@ def _detect_faces_yunet(frame: np.ndarray, score_threshold: float = None) -> lis
             result.append((x, y, fw, fh, score))
 
     return result
-
-
-def _detect_person_hog(frame: np.ndarray) -> list:
-    """
-    使用 HOG + SVM 人体检测器检测人体，返回人体框 [(x, y, w, h), ...]
-    能检测到侧身、背影等无脸的人像
-    """
-    hog = _load_hog_detector()
-
-    # HOG 检测需要一定分辨率，降采样到 480px 宽
-    h, w = frame.shape[:2]
-    scale = 1.0
-    if w > 480:
-        scale = 480 / w
-        frame = cv2.resize(frame, (480, int(h * scale)))
-
-    try:
-        rects, weights = hog.detectMultiScale(
-            frame,
-            winStride=(8, 8),
-            padding=(4, 4),
-            scale=1.05,
-            hitThreshold=0.3,  # 提高 SVM 决策阈值，减少误报（默认 0 太宽松）
-        )
-    except Exception:
-        return []
-
-    if len(rects) == 0:
-        return []
-
-    # 还原到原图坐标
-    persons = []
-    for (x, y, bw, bh) in rects:
-        ox = int(x / scale)
-        oy = int(y / scale)
-        obw = int(bw / scale)
-        obh = int(bh / scale)
-        persons.append((ox, oy, obw, obh))
-
-    # NMS 去重
-    if len(persons) > 1:
-        weights_np = np.array(weights).flatten() if len(weights) > 0 else np.ones(len(persons))
-        indices = cv2.dnn.NMSBoxes(
-            [[x, y, w, h] for (x, y, w, h) in persons],
-            weights_np.tolist(),
-            score_threshold=0.0,
-            nms_threshold=0.4,
-        )
-        if len(indices) > 0:
-            indices = indices.flatten() if hasattr(indices, 'flatten') else indices
-            persons = [persons[i] for i in indices]
-
-    return persons
 
 
 def _calc_box_ratio(box, frame_shape) -> float:
@@ -446,14 +383,12 @@ def detect_face_info(
     effective_region: Optional[Tuple[int, int, int, int]] = None,
 ) -> dict:
     """
-    对单帧进行 YuNet 人脸 + HOG 人体检测，返回:
+    对单帧进行 YuNet 人脸检测，返回:
     {
         "has_person": bool,
         "face_ratio": float,    # 最大人脸占【有效画面】比例 (0~1)
-        "person_ratio": float,  # 最大人体占画面比例 (0~1)
         "good_composition": bool,
         "face_count": int,      # 可辨识人脸数量
-        "person_count": int,    # HOG 检测到的人体数量
         "face_cropped": bool,   # 最大人脸是否被裁头
         "face_in_safe_zone": bool,  # 最大人脸是否在安全区内
         "head_margin_ratio": float, # 头顶留白比例
@@ -467,10 +402,8 @@ def detect_face_info(
     result = {
         "has_person": False,
         "face_ratio": 0.0,
-        "person_ratio": 0.0,
         "good_composition": False,
         "face_count": 0,
-        "person_count": 0,
         "face_cropped": False,
         "face_in_safe_zone": True,
         "head_margin_ratio": 1.0,
@@ -485,11 +418,10 @@ def detect_face_info(
             result["has_black_bars"] = True
 
     max_face_ratio = 0.0
-    max_person_ratio = 0.0
     all_face_ratios = []
     best_face_box = None  # 跟踪最大人脸框（用于构图检测）
 
-    # ── 1. YuNet 人脸检测 ──
+    # ── YuNet 人脸检测 ──
     yunet_faces = _detect_faces_yunet(frame)
     if yunet_faces is not None and len(yunet_faces) > 0:
         result["has_person"] = True
@@ -501,19 +433,6 @@ def detect_face_info(
                 best_face_box = face
             all_face_ratios.append(ratio)
 
-    # ── 2. HOG 人体检测（能捕获背影/侧身）──
-    persons = _detect_person_hog(frame)
-    if len(persons) > 0:
-        valid_person_count = 0
-        for person in persons:
-            ratio = _calc_box_ratio(person, frame.shape)
-            max_person_ratio = max(max_person_ratio, ratio)
-            if ratio >= MIN_PERSON_RATIO:
-                valid_person_count += 1
-        if valid_person_count > 0:
-            result["has_person"] = True
-        result["person_count"] = valid_person_count
-
     # 统计"视觉显著"的人脸数量（相对比例过滤）
     if all_face_ratios:
         relative_threshold = max(max_face_ratio * FACE_RELATIVE_THRESHOLD, MIN_FACE_RATIO)
@@ -521,7 +440,7 @@ def detect_face_info(
     else:
         valid_face_count = 0
 
-    # ── 3. 构图安全性检测（对最大人脸做检查）──
+    # ── 构图安全性检测（对最大人脸做检查）──
     if best_face_box is not None:
         composition = check_face_composition(best_face_box, frame.shape, effective_region)
         result["face_cropped"] = composition["is_cropped"]
@@ -529,7 +448,6 @@ def detect_face_info(
         result["head_margin_ratio"] = composition["head_margin_ratio"]
 
     result["face_ratio"] = round(float(max_face_ratio), 4)
-    result["person_ratio"] = round(float(max_person_ratio), 4)
     # 黄金人像：face_ratio 在区间内 + 构图合格（未裁头 + 在安全区内）
     ratio_in_range = FACE_RATIO_TIER_LOW <= max_face_ratio <= FACE_RATIO_TIER_HIGH
     composition_ok = not result["face_cropped"] and result["face_in_safe_zone"]
@@ -539,13 +457,43 @@ def detect_face_info(
     return result
 
 
+def _classify_frame_label(face_ratio: float, face_count: int,
+                          face_cropped: bool, face_in_safe_zone: bool) -> str:
+    """
+    对单帧做独立分类（与 shot_type_detect.classify_shot_label 逻辑一致）。
+    内联在此处避免循环 import，阈值完全复用 constants.py。
+    """
+    if face_ratio > FACE_RATIO_TIER_HIGH:
+        return "近景人像"
+    elif face_ratio >= FACE_RATIO_TIER_LOW:
+        if face_cropped or not face_in_safe_zone:
+            return "近景人像"
+        return "黄金人像"
+    elif face_ratio >= FACE_RATIO_DISTANT_MIN:
+        return "远景人像"
+    if face_count > 0:
+        return "远景人像"
+    return "空镜"
+
+
+# 帧分类优先级：黄金人像 > 近景人像 > 远景人像 > 空镜
+_FRAME_LABEL_PRIORITY = {"黄金人像": 0, "近景人像": 1, "远景人像": 2, "空镜": 3}
+
+
 def detect_face_info_from_frames(
     frames: Dict[int, np.ndarray],
     resize_width: int = 640,
     effective_region: Optional[Tuple[int, int, int, int]] = None,
 ) -> dict:
     """
-    对已读取的多帧进行人脸 + 人体检测（复用帧，避免重复读取视频）。
+    对已读取的多帧进行人脸检测（复用帧，避免重复读取视频）。
+
+    ★ 聚合策略（v2 — 逐帧独立分类，选最优帧）：
+    - 每帧独立做人脸检测 + 构图检测 + 分类
+    - 按优先级选最优帧：黄金人像 > 近景人像 > 远景人像 > 空镜
+    - 最优帧的 face_ratio / 构图信息作为整个镜头的代表值
+    - face_count 取所有帧最大值（不变）
+    - 返回 best_frame_num，供调用方更新封面
 
     Args:
         frames: {frame_num: BGR_image, ...} 已读好的帧字典
@@ -557,22 +505,22 @@ def detect_face_info_from_frames(
         {
             "has_person": bool,
             "face_ratio": float,
-            "person_ratio": float,
             "good_composition": bool,
             "face_count": int,
-            "person_count": int,
             "face_cropped": bool,
             "face_in_safe_zone": bool,
             "head_margin_ratio": float,
             "has_black_bars": bool,
-            "per_frame": {frame_num: {face_ratio, person_ratio, face_count, person_count}, ...}
+            "best_frame_num": int | None,  # ★ 最优帧帧号，供封面更新
+            "per_frame": {frame_num: {face_ratio, face_count}, ...}
         }
     """
     default_result = {
-        "has_person": False, "face_ratio": 0.0, "person_ratio": 0.0,
-        "good_composition": False, "face_count": 0, "person_count": 0,
+        "has_person": False, "face_ratio": 0.0,
+        "good_composition": False, "face_count": 0,
         "face_cropped": False, "face_in_safe_zone": True, "head_margin_ratio": 1.0,
         "has_black_bars": False,
+        "best_frame_num": None,
         "per_frame": {},
     }
 
@@ -580,19 +528,14 @@ def detect_face_info_from_frames(
         return default_result
 
     best_has_person = False
-    best_person_ratio = 0.0
-    best_good_composition = False
     best_has_black_bars = False
     per_frame = {}
 
-    # ★ face_ratio 取中位数（抗推拉镜头干扰），构图信息跟随中位数帧
-    # face_count 取所有帧最大值（人数筛选用）
-    # person_count 取所有帧最大值（HOG 不太稳定，取最佳表现更合理）
+    # face_count 取所有帧最大值（不变）
     best_face_count = 0
-    best_person_count = 0
 
-    # 先收集所有帧的检测结果
-    frame_results = []  # [(fn, info), ...]
+    # ★ 逐帧独立分类，记录每帧的分类结果
+    frame_classifications = []  # [(fn, info, label, priority), ...]
 
     for fn, frame in frames.items():
         if frame is None:
@@ -622,55 +565,46 @@ def detect_face_info_from_frames(
 
         per_frame[fn] = {
             "face_ratio": info["face_ratio"],
-            "person_ratio": info["person_ratio"],
             "face_count": info["face_count"],
-            "person_count": info["person_count"],
         }
-
-        frame_results.append((fn, info))
 
         if info["has_person"]:
             best_has_person = True
         if info["has_black_bars"]:
             best_has_black_bars = True
 
-        best_person_ratio = max(best_person_ratio, info["person_ratio"])
-        if info["good_composition"]:
-            best_good_composition = True
-
-        # face_count 取所有帧最大值（人数筛选用）
         best_face_count = max(best_face_count, info["face_count"])
-        # person_count 取最大值
-        best_person_count = max(best_person_count, info["person_count"])
 
-    # ★ face_ratio 取中位数帧的值，构图信息跟随中位数帧
-    if frame_results:
-        # 按 face_ratio 排序，取中位数帧
-        sorted_by_ratio = sorted(frame_results, key=lambda x: x[1]["face_ratio"])
-        median_idx = len(sorted_by_ratio) // 2
-        median_fn, median_info = sorted_by_ratio[median_idx]
-        median_face_ratio = median_info["face_ratio"]
-        # 构图信息跟随中位数帧（代表镜头的"主要状态"）
-        median_face_cropped = median_info["face_cropped"]
-        median_face_in_safe_zone = median_info["face_in_safe_zone"]
-        median_head_margin_ratio = median_info["head_margin_ratio"]
-    else:
-        median_face_ratio = 0.0
-        median_face_cropped = False
-        median_face_in_safe_zone = True
-        median_head_margin_ratio = 1.0
+        # ★ 逐帧独立分类
+        label = _classify_frame_label(
+            face_ratio=info["face_ratio"],
+            face_count=info["face_count"],
+            face_cropped=info["face_cropped"],
+            face_in_safe_zone=info["face_in_safe_zone"],
+        )
+        priority = _FRAME_LABEL_PRIORITY.get(label, 3)
+        frame_classifications.append((fn, info, label, priority))
+
+    if not frame_classifications:
+        return default_result
+
+    # ★ 按优先级排序：黄金 > 近景 > 远景 > 空镜
+    # 同优先级时，优先选 face_ratio 更大的帧（构图更饱满）
+    frame_classifications.sort(key=lambda x: (x[3], -x[1]["face_ratio"]))
+
+    # 选最优帧作为整个镜头的代表
+    best_fn, best_info, best_label, _ = frame_classifications[0]
 
     return {
         "has_person": best_has_person,
-        "face_ratio": round(float(median_face_ratio), 4),
-        "person_ratio": round(float(best_person_ratio), 4),
-        "good_composition": best_good_composition,
+        "face_ratio": round(float(best_info["face_ratio"]), 4),
+        "good_composition": bool(best_info["good_composition"]),
         "face_count": best_face_count,
-        "person_count": best_person_count,
-        "face_cropped": median_face_cropped,
-        "face_in_safe_zone": median_face_in_safe_zone,
-        "head_margin_ratio": median_head_margin_ratio,
+        "face_cropped": best_info["face_cropped"],
+        "face_in_safe_zone": best_info["face_in_safe_zone"],
+        "head_margin_ratio": best_info["head_margin_ratio"],
         "has_black_bars": best_has_black_bars,
+        "best_frame_num": best_fn,
         "per_frame": per_frame,
     }
 
@@ -683,7 +617,7 @@ def detect_face_info_multi_frame(
     effective_region: Optional[Tuple[int, int, int, int]] = None,
 ) -> dict:
     """
-    多帧采样人脸 + 人体检测 — 在镜头的 25%、50%、75% 位置采样，
+    多帧采样人脸检测 — 在镜头的 25%、50%、75% 位置采样，
     取各指标的最大值，大幅提高检测命中率。
 
     Args:
@@ -699,8 +633,8 @@ def detect_face_info_multi_frame(
         同 detect_face_info_from_frames 的返回值
     """
     default_result = {
-        "has_person": False, "face_ratio": 0.0, "person_ratio": 0.0,
-        "good_composition": False, "face_count": 0, "person_count": 0,
+        "has_person": False, "face_ratio": 0.0,
+        "good_composition": False, "face_count": 0,
         "per_frame": {},
     }
 
@@ -740,17 +674,17 @@ def detect_face_info_mid_frame(
     video_path: str, mid_frame: int
 ) -> dict:
     """
-    只对镜头中间帧做人脸 + 人体检测（兼容旧调用）
+    只对镜头中间帧做人脸检测（兼容旧调用）
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"has_person": False, "face_ratio": 0.0, "person_ratio": 0.0, "good_composition": False}
+        return {"has_person": False, "face_ratio": 0.0, "good_composition": False}
 
     try:
         cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
         ret, frame = cap.read()
         if not ret or frame is None:
-            return {"has_person": False, "face_ratio": 0.0, "person_ratio": 0.0, "good_composition": False}
+            return {"has_person": False, "face_ratio": 0.0, "good_composition": False}
 
         # 降采样到 640px 宽度加速检测
         h, w = frame.shape[:2]
@@ -766,17 +700,16 @@ def detect_face_info_mid_frame(
 def quick_triage_from_frames(frames: Dict[int, np.ndarray]) -> dict:
     """
     快速预筛：基于已读帧，判断镜头是否值得深度分析。
-    YuNet 人脸 + HOG 人体兜底，宁多勿漏。
+    仅使用 YuNet 人脸检测。
 
     Args:
         frames: {frame_num: BGR_image, ...}
 
     Returns:
-        {"worth": bool, "best_face_count": int, "best_face_ratio": float, "has_person_body": bool}
+        {"worth": bool, "best_face_count": int, "best_face_ratio": float}
     """
     best_face_count = 0
     best_face_ratio = 0.0
-    has_person_body = False
 
     for fn, frame in frames.items():
         if frame is None:
@@ -790,7 +723,7 @@ def quick_triage_from_frames(frames: Dict[int, np.ndarray]) -> dict:
         else:
             small = frame
 
-        # 1) YuNet 人脸检测（预筛用更低置信度）
+        # YuNet 人脸检测（预筛用更低置信度）
         faces = _detect_faces_yunet(small, score_threshold=YUNET_TRIAGE_SCORE)
         if faces:
             valid_count = 0
@@ -803,25 +736,8 @@ def quick_triage_from_frames(frames: Dict[int, np.ndarray]) -> dict:
             best_face_count = max(best_face_count, valid_count)
             best_face_ratio = max(best_face_ratio, max_ratio)
 
-        # 2) 人脸没检测到时，HOG 检测人体兜底（侧身/背影/远景小人）
-        if best_face_count == 0 and not has_person_body:
-            # HOG 用 320px 快速跑一次
-            if w > 320:
-                scale_hog = 320 / w
-                hog_frame = cv2.resize(frame, (320, int(h * scale_hog)))
-            else:
-                hog_frame = frame
-            persons = _detect_person_hog(hog_frame)
-            if len(persons) > 0:
-                # 只有面积比例足够大的人体才算有效（过滤柱子/文字/光影误检）
-                for p in persons:
-                    if _calc_box_ratio(p, hog_frame.shape) >= MIN_PERSON_RATIO:
-                        has_person_body = True
-                        break
-
     return {
-        "worth": best_face_count > 0 or has_person_body,
+        "worth": best_face_count > 0,
         "best_face_count": best_face_count,
         "best_face_ratio": best_face_ratio,
-        "has_person_body": has_person_body,
     }

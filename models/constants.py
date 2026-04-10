@@ -51,9 +51,6 @@ MIN_FACE_RATIO = 0.002
 #            背景路人通常不到主体的 10% → 被过滤
 FACE_RELATIVE_THRESHOLD = 0.3
 
-# HOG 人体检测最小面积比例（低于此值很可能是误检：柱子/文字/光影）
-MIN_PERSON_RATIO = 0.02
-
 # ── 宣发人像分类阈值（基于最大人脸占画面比例） ──
 # 空镜: face_count == 0 且 face_ratio < 0.07%
 # 远景人像: 0.07% ≤ face_ratio < 0.7%（含 face_count=0 但有小人脸的情况）

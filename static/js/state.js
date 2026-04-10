@@ -29,11 +29,18 @@ let selectedShots = new Set();
 let currentPreviewShot = null;
 let currentPreviewIndex = -1;
 let previewMode = 'play'; // play | freeze | trim
+let pvMuted = false; // 预览弹窗静音状态（跨镜头保持）
 
 // 裁剪
 let trimStart = 0;
 let trimEnd = 0;
 let trimMode = false;
+
+// 编辑模式（预览弹窗内的入出点/拆分编辑）
+let pvEditMode = false;
+// 编辑模式前的原始入出点（用于取消时恢复）
+let pvEditOrigTrimStart = 0;
+let pvEditOrigTrimEnd = 0;
 
 // 预览进度条窗口范围
 let viewStart = 0;   // 进度条左端对应的视频时间
@@ -67,6 +74,11 @@ let hoverVideoElements = new Map(); // shotId -> video element
 
 // 预览出点精确监控
 let pvBoundaryRAF = null; // requestAnimationFrame ID，用于精确出点检测
+
+// 调试面板
+let prevDebugShot = null;               // 上一个镜头数据（用于差异对比）
+let debugPanelVisible = localStorage.getItem('pv_debug_visible') === 'true';  // 面板是否可见
+let titleClickTimestamps = [];          // 标题点击时间戳（用于三连击检测）
 
 // 后台分析
 let bgTaskPolling = false;      // 是否正在轮询后台状态

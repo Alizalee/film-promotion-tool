@@ -136,10 +136,8 @@
     <div class="selection-bar" id="selectionBar">
         <div class="selection-bar-thumbs" id="selectionBarThumbs"></div>
         <div class="selection-bar-info" id="selectionBarInfo">已选 0 个</div>
-        <div class="selection-bar-actions">
-            <button class="btn-secondary" onclick="favoriteAllSelected()" style="height:32px;font-size:12px">全部收藏</button>
-            <button class="btn-primary" onclick="openExportPanel()" style="height:32px;font-size:12px">导出镜头</button>
-            <button class="btn-text" onclick="clearSelection()" style="font-size:12px">取消</button>
+        <div class="selection-bar-actions" id="selectionBarActions">
+            <!-- 按钮由 updateSelectionBar() 动态渲染 -->
         </div>
     </div>
 

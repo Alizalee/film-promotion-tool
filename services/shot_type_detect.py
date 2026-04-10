@@ -26,7 +26,7 @@ def classify_shot_label(
         face_ratio: 最大人脸框面积占【有效画面】面积的比例 (0~1)
         face_cropped: 人脸是否被裁头（头顶被画面上边缘截断）
         face_in_safe_zone: 人脸中心是否在安全区域内
-        **kwargs: 兼容旧调用传入的 has_person / person_count（忽略）
+        **kwargs: 兼容旧调用传入的额外参数（忽略）
 
     Returns:
         镜头标签: "近景人像" | "黄金人像" | "远景人像" | "空镜"
@@ -53,11 +53,10 @@ def classify_shot_type(
     has_person: bool = False,
     face_ratio: float = 0.0,
     frame=None,
-    person_ratio: float = 0.0,
     face_count: int = 0,
-    person_count: int = 0,
     face_cropped: bool = False,
     face_in_safe_zone: bool = True,
+    **kwargs,
 ) -> str:
     """
     兼容旧接口的分类函数 — 内部调用 classify_shot_label。
@@ -74,11 +73,10 @@ def detect_shot_type_for_frame(
     frame=None,
     has_person: bool = False,
     face_ratio: float = 0.0,
-    person_ratio: float = 0.0,
     face_count: int = 0,
-    person_count: int = 0,
     face_cropped: bool = False,
     face_in_safe_zone: bool = True,
+    **kwargs,
 ) -> str:
     """
     对单帧图像进行镜头分类。

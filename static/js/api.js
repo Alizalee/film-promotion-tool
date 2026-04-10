@@ -136,11 +136,11 @@ const API = {
         return res.json();
     },
 
-    async deleteVideo(videoPath) {
+    async deleteVideo(videoPath, keepFavorites = true) {
         const res = await fetch('/api/videos/delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ video_path: videoPath }),
+            body: JSON.stringify({ video_path: videoPath, keep_favorites: keepFavorites }),
         });
         return res.json();
     },
@@ -202,6 +202,15 @@ const API = {
         return results;
     },
 
+    async deleteShots(shotIds) {
+        const res = await fetch('/api/shots/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ shot_ids: shotIds }),
+        });
+        return res.json();
+    },
+
     async trimShot(shotId, newStart, newEnd) {
         const res = await fetch('/api/trim_shot', {
             method: 'POST',
@@ -225,6 +234,15 @@ const API = {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ shot_id_a: shotIdA, shot_id_b: shotIdB }),
+        });
+        return res.json();
+    },
+
+    async splitShot(shotId, splitTime) {
+        const res = await fetch('/api/split_shot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ shot_id: shotId, split_time: splitTime }),
         });
         return res.json();
     },

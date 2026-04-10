@@ -453,7 +453,6 @@ def build_shots_fast(
                 "has_person": False,
                 "face_ratio": 0.0,
                 "face_count": 0,
-                "person_ratio": 0.0,
                 "good_composition": False,
                 "motion_score": 0.0,
                 "shot_type": "",
@@ -485,19 +484,16 @@ def select_representative_frame(
         cap: VideoCapture
         start_frame / end_frame: 帧范围
         shot_label: "近景人像" | "黄金人像" | "远景人像" | "空镜"
-        face_info_by_pos: {frame_num: {face_ratio, person_ratio, face_count}} 各采样帧的检测结果
+        face_info_by_pos: {frame_num: {face_ratio, face_count}} 各采样帧的检测结果
 
     Returns:
         (frame_num, frame_image) 最佳代表帧的帧号和图像
     """
     if shot_label in ("近景人像", "黄金人像", "远景人像") and face_info_by_pos:
-        # 选人脸/人体占比最大的帧
+        # 选人脸占比最大的帧
         best_fn = max(
             face_info_by_pos.keys(),
-            key=lambda fn: (
-                face_info_by_pos[fn].get("person_ratio", 0) +
-                face_info_by_pos[fn].get("face_ratio", 0)
-            )
+            key=lambda fn: face_info_by_pos[fn].get("face_ratio", 0)
         )
         cap.set(cv2.CAP_PROP_POS_FRAMES, best_fn)
         ret, frame = cap.read()
