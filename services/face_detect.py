@@ -2,6 +2,8 @@
 import os
 import cv2
 import logging
+import tempfile
+import shutil
 import numpy as np
 from typing import Optional, List, Dict, Tuple
 
@@ -28,14 +30,17 @@ logger = logging.getLogger(__name__)
 # ─── 全局加载模型（避免每次调用重复加载） ───
 
 _yunet_detector = None
+_yunet_temp_model_path = None  # 临时 ASCII 路径（中文路径 fallback）
 
 
 def _load_yunet(input_w: int = 320, input_h: int = 320):
     """
     加载 YuNet 人脸检测器（OpenCV 4.5.4+ 内置，零额外依赖）。
     全局单例，按需更新 input size。
+    ★ 中文路径兼容：如果模型文件路径含非 ASCII 字符导致 OpenCV DNN 加载失败，
+      自动复制到临时 ASCII 路径再加载。
     """
-    global _yunet_detector
+    global _yunet_detector, _yunet_temp_model_path
 
     # 尝试查找 YuNet ONNX 模型文件
     model_path = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
@@ -61,9 +66,11 @@ def _load_yunet(input_w: int = 320, input_h: int = 320):
         _yunet_detector.setInputSize((input_w, input_h))
         return _yunet_detector
 
+    # ★ 尝试加载，如果失败（中文路径问题）则 fallback 到临时 ASCII 路径
+    load_path = model_path
     try:
         _yunet_detector = cv2.FaceDetectorYN.create(
-            model=model_path,
+            model=load_path,
             config="",
             input_size=(input_w, input_h),
             score_threshold=YUNET_SCORE_THRESHOLD,
@@ -73,7 +80,31 @@ def _load_yunet(input_w: int = 320, input_h: int = 320):
         logger.info("YuNet 人脸检测器加载成功")
         return _yunet_detector
     except Exception as e:
-        logger.warning(f"YuNet 加载失败: {e}")
+        logger.warning(f"YuNet 直接加载失败（可能是路径含中文）: {e}")
+
+    # ★ Fallback：复制到临时 ASCII 路径
+    try:
+        temp_dir = os.path.join(tempfile.gettempdir(), "_cv_models")
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, "face_detection_yunet_2023mar.onnx")
+
+        # 只有当临时文件不存在或大小不一致时才复制
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) != os.path.getsize(model_path):
+            shutil.copy2(model_path, temp_path)
+
+        _yunet_detector = cv2.FaceDetectorYN.create(
+            model=temp_path,
+            config="",
+            input_size=(input_w, input_h),
+            score_threshold=YUNET_SCORE_THRESHOLD,
+            nms_threshold=YUNET_NMS_THRESHOLD,
+            top_k=50,
+        )
+        _yunet_temp_model_path = temp_path
+        logger.info(f"YuNet 通过临时路径加载成功: {temp_path}")
+        return _yunet_detector
+    except Exception as e2:
+        logger.warning(f"YuNet 临时路径加载也失败: {e2}")
         return None
 
 

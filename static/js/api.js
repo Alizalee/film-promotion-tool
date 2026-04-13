@@ -247,21 +247,7 @@ const API = {
         return res.json();
     },
 
-    // ── 导出 ──
-    async exportShots(shotIds, outputDir) {
-        const res = await fetch('/api/export_shots', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ shot_ids: shotIds, output_dir: outputDir }),
-        });
-        return res.json();
-    },
-
-    async browseDir(path) {
-        const query = path ? `?path=${encodeURIComponent(path)}` : '';
-        const res = await fetch(`/api/browse_dir${query}`);
-        return res.json();
-    },
+    // ── 导出（已改为浏览器下载方式，逻辑在 export.js 中） ──
 
     // ── 后台分析状态 ──
     async getBgTaskStatus() {

@@ -122,9 +122,25 @@ def extract_frame(video_path: str, frame_num: int) -> Optional[np.ndarray]:
     return None
 
 
+def _safe_imwrite(path: str, img: np.ndarray, params: list):
+    """
+    安全的图片写入 — 兼容中文/非 ASCII 路径。
+    OpenCV 4.x 的 cv2.imwrite 在某些平台 + Python 版本下
+    不支持路径含非 ASCII 字符，改用 imencode + 手动写文件。
+    """
+    ext = os.path.splitext(path)[1] or '.jpg'
+    ok, buf = cv2.imencode(ext, img, params)
+    if ok:
+        os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+        with open(path, 'wb') as f:
+            f.write(buf.tobytes())
+        return True
+    return False
+
+
 def save_frame_jpeg(frame: np.ndarray, output_path: str):
     """将帧保存为 JPEG 文件"""
-    cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    _safe_imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
 
 
 def save_thumbnail(frame: np.ndarray, output_path: str):
@@ -133,7 +149,7 @@ def save_thumbnail(frame: np.ndarray, output_path: str):
     if w > THUMBNAIL_WIDTH:
         scale = THUMBNAIL_WIDTH / w
         frame = cv2.resize(frame, (THUMBNAIL_WIDTH, int(h * scale)))
-    cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, THUMBNAIL_JPEG_QUALITY])
+    _safe_imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, THUMBNAIL_JPEG_QUALITY])
 
 
 def build_shots_fast(

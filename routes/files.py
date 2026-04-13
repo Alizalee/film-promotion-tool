@@ -220,17 +220,19 @@ async def get_shot_video(shot_id: str):
             final_output,
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await process.communicate()
+        def _run_ffmpeg():
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
-        if process.returncode != 0:
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg)
+
+        if result.returncode != 0:
             raise HTTPException(
                 status_code=500,
-                detail=f"FFmpeg 裁剪失败: {stderr.decode()[:200]}",
+                detail=f"FFmpeg 裁剪失败: {result.stderr.decode(errors='replace')[:200]}",
             )
 
     return FileResponse(
@@ -341,12 +343,14 @@ async def get_shot_video_range(shot_id: str, request: Request):
             final_output,
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await process.communicate()
+        def _run_ffmpeg_range():
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg_range)
 
     if not os.path.exists(final_output):
         raise HTTPException(status_code=500, detail="无法生成镜头视频")

@@ -2,6 +2,7 @@
 import os
 import cv2
 import asyncio
+import subprocess
 import logging
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query
@@ -473,19 +474,21 @@ async def _clip_single_shot(shot: dict, proj_dir: str):
     ]
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await process.communicate()
+        def _run_ffmpeg():
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
-        if process.returncode == 0 and os.path.exists(clip_path):
+        result = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg)
+
+        if result.returncode == 0 and os.path.exists(clip_path):
             shot["clip_file"] = clip_filename
             logger.info(f"预裁剪镜头: {shot['id']} → {clip_filename}")
             return True
         else:
-            logger.warning(f"预裁剪失败: {shot['id']}: {stderr.decode()[:100]}")
+            logger.warning(f"预裁剪失败: {shot['id']}: {result.stderr.decode(errors='replace')[:100]}")
             return False
     except Exception as e:
         logger.warning(f"预裁剪异常: {shot['id']}: {e}")
