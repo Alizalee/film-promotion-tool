@@ -98,11 +98,19 @@ async def delete_project(req: ProjectDeleteRequest):
     video_paths_to_clean = []
     if project_data:
         from models.constants import UPLOADS_DIR
-        uploads_norm = os.path.normpath(os.path.abspath(UPLOADS_DIR)) + os.sep
+        uploads_norm = os.path.normcase(os.path.normpath(os.path.abspath(UPLOADS_DIR))) + os.sep
         for vpath in project_data.get("video_paths", []):
+            if not vpath:
+                continue
+            vpath_norm = os.path.normcase(os.path.normpath(os.path.abspath(vpath)))
             # 只清理 workspace/uploads 目录下的文件
-            if vpath and os.path.normpath(os.path.abspath(vpath)).startswith(uploads_norm) and os.path.exists(vpath):
+            if vpath_norm.startswith(uploads_norm) and os.path.exists(vpath):
                 video_paths_to_clean.append(vpath)
+            else:
+                # 双保险：按文件名在 uploads 目录中查找
+                upload_file = os.path.join(UPLOADS_DIR, os.path.basename(vpath))
+                if os.path.exists(upload_file):
+                    video_paths_to_clean.append(upload_file)
 
     # 删除项目目录（帧、saved_frames 等）
     proj_dir = get_project_dir(req.project_id)

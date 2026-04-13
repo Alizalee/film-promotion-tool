@@ -161,7 +161,7 @@ def build_shots_fast(
     cancel_check: Callable[[], bool] = None,
 ) -> list:
     """
-    快速构建 Shot 数据 — 只做镜头拆分 + 提取首帧缩略图。
+    快速构建 Shot 数据 — 只做镜头拆分 + 提取中间帧缩略图。
     跳过动态值计算和人脸检测，让用户快速进入主页面。
 
     Args:
@@ -183,9 +183,9 @@ def build_shots_fast(
     if not cap.isOpened():
         return shots
 
-    # 收集所有首帧帧号并排序，减少随机 seek
+    # 按中间帧帧号排序，减少随机 seek（封面取中间帧）
     indexed_scenes = list(enumerate(scenes))
-    sorted_scenes = sorted(indexed_scenes, key=lambda x: x[1][0])
+    sorted_scenes = sorted(indexed_scenes, key=lambda x: (x[1][0] + x[1][1]) // 2)
 
     # 先按排序顺序提取帧
     frame_data = {}  # orig_idx -> (frame_file, frame_path)
@@ -201,8 +201,9 @@ def build_shots_fast(
             frame_file = f"{shot_id}.jpg"
             frame_path = os.path.join(frames_dir, frame_file)
 
-            # 提取首帧并保存为缩略图
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            # 提取中间帧并保存为缩略图（避免黑屏过渡导致封面全黑）
+            mid = (start_frame + end_frame) // 2
+            cap.set(cv2.CAP_PROP_POS_FRAMES, mid)
             ret, frame = cap.read()
             if ret and frame is not None:
                 save_thumbnail(frame, frame_path)

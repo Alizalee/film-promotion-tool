@@ -1220,13 +1220,42 @@ async def delete_video(req: VideoDeleteRequest):
         video_count=len(video_paths),
     )
 
+    # ★ 停止后台分析线程（释放 cv2.VideoCapture 文件锁，避免 Windows 下删不掉）
+    _stop_running_bg_task()
+
     # 删除上传目录中的视频文件（只删除 workspace/uploads 内的）
-    uploads_norm = os.path.normpath(os.path.abspath(UPLOADS_DIR)) + os.sep
-    if os.path.exists(video_path) and os.path.normpath(os.path.abspath(video_path)).startswith(uploads_norm):
+    uploads_norm = os.path.normcase(os.path.normpath(os.path.abspath(UPLOADS_DIR))) + os.sep
+    video_norm = os.path.normcase(os.path.normpath(os.path.abspath(video_path)))
+
+    def _try_remove(fpath: str):
+        """尝试删除文件，失败则等待后重试（应对 Windows 文件锁）"""
         try:
-            os.remove(video_path)
-        except Exception:
-            pass
+            os.remove(fpath)
+            logger.info(f"已删除上传文件: {fpath}")
+        except Exception as e:
+            logger.warning(f"删除上传文件失败: {fpath}, 原因: {e}")
+            time.sleep(0.5)
+            try:
+                os.remove(fpath)
+                logger.info(f"重试删除成功: {fpath}")
+            except Exception as e2:
+                logger.error(f"重试删除仍失败: {fpath}, 原因: {e2}")
+
+    if os.path.exists(video_path) and video_norm.startswith(uploads_norm):
+        _try_remove(video_path)
+    else:
+        # 双保险：按文件名在 uploads 目录中查找并删除
+        upload_file = os.path.join(UPLOADS_DIR, os.path.basename(video_path))
+        if os.path.exists(upload_file):
+            _try_remove(upload_file)
+
+    # ★ 如果项目还有其他视频且有未分析镜头，重新启动后台分析
+    if video_paths:
+        remaining_data = load_project_data(project_id)
+        if remaining_data:
+            pending = sum(1 for s in remaining_data.get("shots", []) if not s.get("face_detected", False))
+            if pending > 0:
+                _start_background_analysis(project_id, video_paths)
 
     return {
         "success": True,
@@ -1251,14 +1280,36 @@ async def clear_videos():
 
     proj_dir = get_project_dir(project_id)
 
-    # 删除 uploads 中的关联视频文件
-    uploads_norm = os.path.normpath(os.path.abspath(UPLOADS_DIR)) + os.sep
-    for vpath in project_data.get("video_paths", []):
-        if vpath and os.path.normpath(os.path.abspath(vpath)).startswith(uploads_norm) and os.path.exists(vpath):
+    # ★ 停止后台分析线程（释放 cv2.VideoCapture 文件锁，避免 Windows 下删不掉）
+    _stop_running_bg_task()
+
+    def _try_remove(fpath: str):
+        """尝试删除文件，失败则等待后重试（应对 Windows 文件锁）"""
+        try:
+            os.remove(fpath)
+            logger.info(f"已删除上传文件: {fpath}")
+        except Exception as e:
+            logger.warning(f"删除上传文件失败: {fpath}, 原因: {e}")
+            time.sleep(0.5)
             try:
-                os.remove(vpath)
-            except Exception:
-                pass
+                os.remove(fpath)
+                logger.info(f"重试删除成功: {fpath}")
+            except Exception as e2:
+                logger.error(f"重试删除仍失败: {fpath}, 原因: {e2}")
+
+    # 删除 uploads 中的关联视频文件
+    uploads_norm = os.path.normcase(os.path.normpath(os.path.abspath(UPLOADS_DIR))) + os.sep
+    for vpath in project_data.get("video_paths", []):
+        if not vpath:
+            continue
+        vpath_norm = os.path.normcase(os.path.normpath(os.path.abspath(vpath)))
+        if vpath_norm.startswith(uploads_norm) and os.path.exists(vpath):
+            _try_remove(vpath)
+        else:
+            # 双保险：按文件名在 uploads 目录中查找并删除
+            upload_file = os.path.join(UPLOADS_DIR, os.path.basename(vpath))
+            if os.path.exists(upload_file):
+                _try_remove(upload_file)
 
     frames_dir = os.path.join(proj_dir, "frames")
     saved_frames_dir = os.path.join(proj_dir, "saved_frames")

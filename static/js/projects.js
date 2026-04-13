@@ -446,7 +446,7 @@ async function loadVideoList() {
                     <span class="video-filename" title="${escapeHtml(v.path)}">${escapeHtml(v.filename)}</span>
                     ${statusBadge}
                     <span class="video-meta">${formatFileSize(v.size_mb)} · ${v.shot_count} 镜头</span>
-                    <span class="video-delete-btn" onclick="deleteVideoItem('${escapeHtml(v.path)}', '${escapeHtml(v.filename)}')">删除</span>
+                    <span class="video-delete-btn" onclick="deleteVideoItem('${escapeJsString(v.path)}', '${escapeJsString(v.filename)}')">删除</span>
                 </div>
             `;
         }).join('');

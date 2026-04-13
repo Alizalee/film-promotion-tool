@@ -71,7 +71,7 @@ SAFE_ZONE_MARGIN_RATIO = 0.05
 EDGE_THRESHOLD_RATIO = 0.02
 
 # 视频支持格式
-SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
 
 # 静态文件目录
 STATIC_DIR = os.path.join(BASE_DIR, "static")

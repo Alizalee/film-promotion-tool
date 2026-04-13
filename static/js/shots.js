@@ -162,6 +162,7 @@ function renderGrid() {
                  data-shot-id="${shot.id}" 
                  data-index="${idx}"
                  onclick="onShotCardClick(event, '${shot.id}', ${idx})"
+                 onmousedown="onShotCardMouseDown(event, '${shot.id}')"
                  onmouseenter="onShotHoverEnter(this, '${shot.id}')"
                  onmouseleave="onShotHoverLeave(this, '${shot.id}')"
                  draggable="false">
@@ -194,6 +195,9 @@ function renderGrid() {
                             ${shotTypeLabel}
                         </div>
                     </div>
+
+                    <!-- 拖拽合并提示浮层 -->
+                    <div class="merge-hint">释放合并</div>
                 </div>
             </div>
         `;
@@ -299,9 +303,15 @@ function onShotHoverLeave(cardEl, shotId) {
 }
 
 /**
- * 点击镜头卡片 — 始终打开预览（勾选框有 stopPropagation，不会到这里）
+ * 点击镜头卡片 — 打开预览（拖拽结束后不触发，勾选框有 stopPropagation）
  */
+let _mergeDragJustEnded = false;
 function onShotCardClick(event, shotId, index) {
+    // 拖拽刚结束时跳过此次点击
+    if (_mergeDragJustEnded) {
+        _mergeDragJustEnded = false;
+        return;
+    }
     openPreview(shotId, index);
 }
 
@@ -358,15 +368,20 @@ async function updateVideoSourceTags() {
         const durationSec = detail ? (detail.duration_sec || 0) : 0;
         const tooltipText = `${escapeHtml(filename)}\n${formatDuration(durationSec)} · ${shotCount} 个镜头 · ${formatFileSize(sizeMB)}`;
 
+        // ★ 使用 escapeJsString 安全转义，防止 Windows 反斜杠破坏内联 JS 字符串
+        const safeVpath = escapeJsString(vpath);
+        const safeFilename = escapeJsString(filename);
+        const safeTooltip = escapeJsString(tooltipText);
+
         return `
             <div class="sidebar-item ${isChecked ? 'checked' : ''}" 
                  data-video-path="${escapeHtml(vpath)}"
-                 onclick="toggleVideoSourceFilter('${escapeHtml(vpath).replace(/'/g, "\\'")}')" 
-                 onmouseenter="showVideoTooltip(event, '${escapeHtml(tooltipText).replace(/\n/g, '\\n').replace(/'/g, "\\'")}')"
+                 onclick="toggleVideoSourceFilter('${safeVpath}')" 
+                 onmouseenter="showVideoTooltip(event, '${safeTooltip}')"
                  onmouseleave="hideVideoTooltip()">
                 <div class="sidebar-checkbox">✓</div>
                 <span class="sidebar-label">${escapeHtml(shortName)}</span>
-                <span class="sidebar-item-delete" onclick="event.stopPropagation();deleteVideoItem('${escapeHtml(vpath).replace(/'/g, "\\'")}', '${escapeHtml(filename).replace(/'/g, "\\'")}')" title="删除此视频">✕</span>
+                <span class="sidebar-item-delete" onclick="event.stopPropagation();deleteVideoItem('${safeVpath}', '${safeFilename}')" title="删除此视频">✕</span>
             </div>
         `;
     }).join('');
@@ -902,4 +917,298 @@ function updatePeopleFilterVisual() {
         const v = parseInt(chip.dataset.people);
         chip.classList.toggle('active', peopleFilter === v);
     });
+}
+
+/* ═══════════════════════════════════════════════════
+   拖拽合并 — 长按镜头卡片启动拖拽，释放到同源镜头完成合并
+   ═══════════════════════════════════════════════════ */
+
+/** 长按计时器 */
+let _mergeLongPressTimer = null;
+/** 拖拽中的幽灵元素 */
+let _mergeGhostEl = null;
+/** 当前 hover 的目标卡片元素 */
+let _mergeTargetCard = null;
+
+/**
+ * 卡片 mousedown — 启动长按计时（300ms）
+ * 排除勾选框、收藏按钮等交互元素
+ */
+function onShotCardMouseDown(event, shotId) {
+    // 排除：勾选框、收藏按钮、右键
+    if (event.button !== 0) return;
+    const tag = event.target.closest('.shot-check-persistent, .shot-fav-persistent');
+    if (tag) return;
+
+    const card = event.target.closest('.shot-card');
+    if (!card) return;
+
+    const startX = event.clientX;
+    const startY = event.clientY;
+
+    _mergeLongPressTimer = setTimeout(() => {
+        _mergeLongPressTimer = null;
+        startMergeDrag(card, shotId, startX, startY);
+    }, 300);
+
+    // 如果鼠标在 300ms 内移动过多或松开，取消长按
+    const cancelLongPress = () => {
+        if (_mergeLongPressTimer) {
+            clearTimeout(_mergeLongPressTimer);
+            _mergeLongPressTimer = null;
+        }
+        document.removeEventListener('mouseup', onEarlyUp);
+        document.removeEventListener('mousemove', onEarlyMove);
+    };
+    const onEarlyUp = () => cancelLongPress();
+    const onEarlyMove = (e) => {
+        if (Math.abs(e.clientX - startX) > 5 || Math.abs(e.clientY - startY) > 5) {
+            cancelLongPress();
+        }
+    };
+    document.addEventListener('mouseup', onEarlyUp, { once: true });
+    document.addEventListener('mousemove', onEarlyMove);
+}
+
+/**
+ * 进入拖拽模式
+ */
+function startMergeDrag(card, shotId, startX, startY) {
+    const shot = allShots.find(s => s.id === shotId);
+    if (!shot) return;
+
+    isDraggingForMerge = true;
+    mergeSourceShot = shot;
+
+    // 源卡片添加拖拽样式
+    card.classList.add('dragging');
+
+    // 创建跟随鼠标的幽灵缩略图
+    _mergeGhostEl = document.createElement('div');
+    _mergeGhostEl.className = 'merge-ghost';
+    const frameUrl = getFrameUrl(shot.frame_file);
+    _mergeGhostEl.innerHTML = `<img src="${frameUrl}" alt="">`;
+    _mergeGhostEl.style.left = startX + 'px';
+    _mergeGhostEl.style.top = startY + 'px';
+    document.body.appendChild(_mergeGhostEl);
+
+    // 监听全局 mousemove / mouseup / keydown
+    document.addEventListener('mousemove', onMergeDragMove);
+    document.addEventListener('mouseup', onMergeDragEnd);
+    document.addEventListener('keydown', onMergeDragKeyDown);
+}
+
+/**
+ * 拖拽中 — 幽灵跟随鼠标 + 检测目标卡片
+ */
+function onMergeDragMove(event) {
+    if (!isDraggingForMerge) return;
+
+    // 幽灵跟随
+    if (_mergeGhostEl) {
+        _mergeGhostEl.style.left = event.clientX + 'px';
+        _mergeGhostEl.style.top = event.clientY + 'px';
+    }
+
+    // 检测鼠标下方的卡片
+    // 先暂时隐藏幽灵，使 elementFromPoint 能穿透
+    if (_mergeGhostEl) _mergeGhostEl.style.pointerEvents = 'none';
+    const el = document.elementFromPoint(event.clientX, event.clientY);
+    if (_mergeGhostEl) _mergeGhostEl.style.pointerEvents = '';
+
+    const targetCard = el ? el.closest('.shot-card') : null;
+    const sourceCard = document.querySelector('.shot-card.dragging');
+
+    // 清除上一个目标的样式
+    if (_mergeTargetCard && _mergeTargetCard !== targetCard) {
+        _mergeTargetCard.classList.remove('merge-target', 'merge-forbidden');
+    }
+
+    if (targetCard && targetCard !== sourceCard) {
+        const targetShotId = targetCard.dataset.shotId;
+        const targetShot = allShots.find(s => s.id === targetShotId);
+
+        if (targetShot && mergeSourceShot) {
+            const sameSource = targetShot.source_video === mergeSourceShot.source_video;
+            if (sameSource) {
+                targetCard.classList.add('merge-target');
+                targetCard.classList.remove('merge-forbidden');
+            } else {
+                targetCard.classList.add('merge-forbidden');
+                targetCard.classList.remove('merge-target');
+            }
+        }
+        _mergeTargetCard = targetCard;
+    } else {
+        _mergeTargetCard = null;
+    }
+}
+
+/**
+ * 拖拽释放 — 判断目标并弹出确认
+ */
+function onMergeDragEnd(event) {
+    if (!isDraggingForMerge) return;
+
+    // 先检测最终目标
+    if (_mergeGhostEl) _mergeGhostEl.style.pointerEvents = 'none';
+    const el = document.elementFromPoint(event.clientX, event.clientY);
+    if (_mergeGhostEl) _mergeGhostEl.style.pointerEvents = '';
+
+    const targetCard = el ? el.closest('.shot-card') : null;
+    const sourceCard = document.querySelector('.shot-card.dragging');
+
+    let targetShot = null;
+    if (targetCard && targetCard !== sourceCard) {
+        const targetShotId = targetCard.dataset.shotId;
+        targetShot = allShots.find(s => s.id === targetShotId);
+    }
+
+    // 清理拖拽状态
+    cleanupMergeDrag();
+
+    // 判断是否可合并
+    if (targetShot && mergeSourceShot && targetShot.id !== mergeSourceShot.id) {
+        if (targetShot.source_video === mergeSourceShot.source_video) {
+            showMergeConfirm(mergeSourceShot, targetShot);
+        } else {
+            showToast('不同视频来源的镜头无法合并', 'error');
+        }
+    }
+
+    mergeSourceShot = null;
+}
+
+/**
+ * ESC 取消拖拽
+ */
+function onMergeDragKeyDown(event) {
+    if (event.key === 'Escape') {
+        cleanupMergeDrag();
+        mergeSourceShot = null;
+    }
+}
+
+/**
+ * 清理拖拽 DOM 和事件
+ */
+function cleanupMergeDrag() {
+    isDraggingForMerge = false;
+
+    // 标记拖拽刚结束，防止 click 事件穿透打开预览
+    _mergeDragJustEnded = true;
+    setTimeout(() => { _mergeDragJustEnded = false; }, 50);
+
+    // 移除源卡片样式
+    const dragCard = document.querySelector('.shot-card.dragging');
+    if (dragCard) dragCard.classList.remove('dragging');
+
+    // 移除目标卡片样式
+    if (_mergeTargetCard) {
+        _mergeTargetCard.classList.remove('merge-target', 'merge-forbidden');
+        _mergeTargetCard = null;
+    }
+    // 清理所有残留的 merge 样式
+    document.querySelectorAll('.shot-card.merge-target, .shot-card.merge-forbidden').forEach(c => {
+        c.classList.remove('merge-target', 'merge-forbidden');
+    });
+
+    // 移除幽灵
+    if (_mergeGhostEl) {
+        _mergeGhostEl.remove();
+        _mergeGhostEl = null;
+    }
+
+    // 移除全局监听
+    document.removeEventListener('mousemove', onMergeDragMove);
+    document.removeEventListener('mouseup', onMergeDragEnd);
+    document.removeEventListener('keydown', onMergeDragKeyDown);
+}
+
+/**
+ * 显示合并确认弹窗
+ */
+function showMergeConfirm(shotA, shotB) {
+    // 确保 A 在前（按时间顺序）
+    if (shotA.start_time > shotB.start_time) {
+        [shotA, shotB] = [shotB, shotA];
+    }
+
+    const frameA = getFrameUrl(shotA.frame_file);
+    const frameB = getFrameUrl(shotB.frame_file);
+    const mergedDur = formatDuration(shotB.end_time - shotA.start_time);
+    const timeRange = `${formatTimecode(shotA.start_time)} → ${formatTimecode(shotB.end_time)}`;
+
+    // 检查是否不相邻（中间有其他镜头）
+    const idxA = allShots.findIndex(s => s.id === shotA.id);
+    const idxB = allShots.findIndex(s => s.id === shotB.id);
+    const notAdjacent = Math.abs(idxA - idxB) > 1;
+
+    const overlayDiv = document.createElement('div');
+    overlayDiv.className = 'modal-overlay';
+    overlayDiv.id = 'mergeConfirmOverlay';
+    overlayDiv.innerHTML = `
+        <div class="modal merge-modal" onclick="event.stopPropagation()">
+            <h3>合并镜头</h3>
+            <div class="merge-preview">
+                <div class="merge-preview-shot">
+                    <img src="${frameA}" alt="镜头 A">
+                </div>
+                <span class="merge-preview-arrow">→</span>
+                <div class="merge-preview-shot">
+                    <img src="${frameB}" alt="镜头 B">
+                </div>
+            </div>
+            <div class="merge-info">
+                合并后时间范围：${timeRange}<br>
+                合并后时长：${mergedDur}
+            </div>
+            ${notAdjacent ? '<div class="merge-warning">⚠ 这两个镜头不相邻，合并后将覆盖中间的时间段</div>' : ''}
+            <div class="merge-actions">
+                <button class="btn-secondary" onclick="closeMergeConfirm()">取消</button>
+                <button class="btn-primary" onclick="executeMerge('${shotA.id}', '${shotB.id}')">确认合并</button>
+            </div>
+        </div>
+    `;
+    overlayDiv.addEventListener('click', closeMergeConfirm);
+    document.body.appendChild(overlayDiv);
+}
+
+/**
+ * 关闭合并确认弹窗
+ */
+function closeMergeConfirm() {
+    const overlay = document.getElementById('mergeConfirmOverlay');
+    if (overlay) overlay.remove();
+}
+
+/**
+ * 执行合并
+ */
+async function executeMerge(shotIdA, shotIdB) {
+    closeMergeConfirm();
+    showToast('正在合并镜头…');
+
+    try {
+        const result = await API.mergeShots(shotIdA, shotIdB);
+        if (result.success) {
+            showToast('镜头合并成功', 'success');
+            await loadShots();
+            updateVideoSourceTags();
+        } else {
+            showToast(result.detail || '合并失败', 'error');
+        }
+    } catch (err) {
+        console.error('合并镜头失败:', err);
+        showToast('合并镜头失败', 'error');
+    }
+}
+
+/**
+ * 格式化时间码为 MM:SS.ms（用于合并弹窗）
+ */
+function formatTimecode(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toFixed(2).padStart(5, '0')}`;
 }

@@ -902,13 +902,15 @@ async def merge_shots(req: MergeShotsRequest):
         "source_video": video_path,
     }
 
-    # 删除旧帧文件
+    # 删除旧帧文件（跳过与新封面同名的文件，避免合并后的封面被误删）
     proj_dir = get_project_dir(project_id)
     frames_dir = os.path.join(proj_dir, "frames")
     for old_shot in [shot_a, shot_b]:
-        old_frame = os.path.join(frames_dir, old_shot.get("frame_file", ""))
-        if os.path.exists(old_frame):
-            os.remove(old_frame)
+        old_frame_name = old_shot.get("frame_file", "")
+        if old_frame_name and old_frame_name != frame_file:
+            old_frame_path = os.path.join(frames_dir, old_frame_name)
+            if os.path.exists(old_frame_path):
+                os.remove(old_frame_path)
 
     # 从列表中移除原两个镜头，插入合并后镜头
     removed_ids = [shot_a["id"], shot_b["id"]]

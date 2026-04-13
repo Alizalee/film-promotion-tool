@@ -49,6 +49,20 @@
 .shot-card.merge-target {
   border: 2px solid var(--accent);
 }
+.shot-card.merge-forbidden {
+  border: 2px solid var(--red);
+  opacity: 0.5;
+}
+.shot-card.merge-forbidden .merge-hint {
+  opacity: 1 !important;
+  background: rgba(255, 69, 58, 0.5);
+  color: #fff;
+  font-size: 0;
+}
+.shot-card.merge-forbidden .merge-hint::after {
+  content: '🚫 不同视频源';
+  font-size: var(--text-sm);
+}
 .shot-card .merge-hint {
   position: absolute;
   inset: 0;
@@ -63,9 +77,30 @@
   opacity: 0;
   pointer-events: none;
   transition: opacity 200ms ease-out;
+  z-index: 5;
 }
 .shot-card.merge-target .merge-hint {
   opacity: 1;
+}
+
+/* 拖拽幽灵缩略图（跟随鼠标） */
+.merge-ghost {
+  position: fixed;
+  width: 100px;
+  height: 56px;
+  border-radius: 6px;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 10000;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  border: 2px solid var(--accent);
+  opacity: 0.85;
+}
+.merge-ghost img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 /* 缩略图容器 */

@@ -97,6 +97,7 @@ async def stream_video(request: Request, source: Optional[str] = Query(None), sh
     ext = os.path.splitext(video_path)[1].lower()
     mime_types = {
         ".mp4": "video/mp4",
+        ".m4v": "video/x-m4v",
         ".mov": "video/quicktime",
         ".avi": "video/x-msvideo",
         ".mkv": "video/x-matroska",

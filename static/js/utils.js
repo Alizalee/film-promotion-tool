@@ -141,6 +141,17 @@ function formatFileSize(mb) {
 }
 
 /**
+ * 转义字符串以便安全嵌入到内联 JavaScript 单引号字符串中
+ */
+function escapeJsString(str) {
+    return str
+        .replace(/\\/g, '\\\\')   // 反斜杠 → 双反斜杠（必须第一个处理）
+        .replace(/'/g, "\\'")     // 单引号 → 转义单引号
+        .replace(/\n/g, '\\n')    // 换行符
+        .replace(/\r/g, '\\r');   // 回车符
+}
+
+/**
  * 防抖
  */
 function debounce(fn, delay) {

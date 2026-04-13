@@ -52,7 +52,7 @@ function initDragDrop() {
 
         const files = Array.from(e.dataTransfer.files).filter(f => {
             const ext = f.name.toLowerCase().split('.').pop();
-            return ['mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm'].includes(ext);
+            return ['mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v'].includes(ext);
         });
 
         if (files.length === 0) {
