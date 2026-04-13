@@ -1,15 +1,16 @@
-"""导出 API 路由 — 批量导出镜头 MP4（浏览器下载方式）"""
+"""导出 API 路由 — 批量导出镜头 MP4（支持选择本地目录导出）"""
 import os
 import shutil
 import asyncio
 import subprocess
 import tempfile
 import zipfile
+import threading
 from urllib.parse import quote
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 from services.project_manager import (
     get_active_project_id,
@@ -18,6 +19,9 @@ from services.project_manager import (
 )
 
 router = APIRouter()
+
+# ── 记住上次选择的导出目录 ─────────────────────────────────────
+_last_export_dir: Optional[str] = None
 
 # ── FFmpeg 自动发现 ──────────────────────────────────────────────
 _FFMPEG_SEARCH_PATHS = [
@@ -52,6 +56,117 @@ def _find_ffmpeg() -> str:
 
 class ExportDownloadRequest(BaseModel):
     shot_ids: List[str]
+
+
+class ExportToDirRequest(BaseModel):
+    shot_ids: List[str]
+    output_dir: str
+
+
+# ── 选择导出目录（系统文件夹选择对话框）──────────────────────
+@router.get("/select_export_dir")
+async def select_export_dir():
+    """
+    弹出系统原生文件夹选择对话框，返回用户选择的目录路径。
+    在线程中执行以避免阻塞事件循环。
+    """
+    global _last_export_dir
+
+    def _pick_folder() -> str:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()                    # 隐藏主窗口
+        root.attributes("-topmost", True)  # 置顶，防止对话框被浏览器遮住
+        root.update()
+
+        initial_dir = _last_export_dir if _last_export_dir and os.path.isdir(_last_export_dir) else os.path.expanduser("~")
+
+        selected = filedialog.askdirectory(
+            title="选择导出保存目录",
+            initialdir=initial_dir,
+        )
+        root.destroy()
+        return selected or ""
+
+    loop = asyncio.get_event_loop()
+    path = await loop.run_in_executor(None, _pick_folder)
+
+    if not path:
+        raise HTTPException(status_code=400, detail="用户取消了目录选择")
+
+    _last_export_dir = path
+    return {"path": path}
+
+
+# ── 获取上次选择的导出目录 ─────────────────────────────────────
+@router.get("/last_export_dir")
+async def last_export_dir():
+    """返回上次选择的导出目录（如果存在且有效）"""
+    if _last_export_dir and os.path.isdir(_last_export_dir):
+        return {"path": _last_export_dir}
+    return {"path": ""}
+
+
+# ── 导出到指定本地目录 ─────────────────────────────────────────
+@router.post("/export_to_dir")
+async def export_to_dir(req: ExportToDirRequest):
+    """
+    批量导出镜头到用户指定的本地目录，直接写入文件。
+    """
+    global _last_export_dir
+
+    pid = get_active_project_id()
+    if not pid:
+        raise HTTPException(status_code=400, detail="没有活跃项目")
+
+    project_data = load_project_data(pid)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="项目数据不存在")
+
+    output_dir = req.output_dir
+    if not os.path.isdir(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=f"无法创建目录: {e}")
+
+    _last_export_dir = output_dir
+
+    shots_map = {}
+    for shot in project_data.get("shots", []):
+        if shot["id"] in req.shot_ids:
+            shots_map[shot["id"]] = shot
+
+    proj_dir = get_project_dir(pid)
+    shots_dir = os.path.join(proj_dir, "shots")
+
+    results = []
+    success_count = 0
+
+    for shot_id in req.shot_ids:
+        shot = shots_map.get(shot_id)
+        if not shot:
+            results.append({"shot_id": shot_id, "error": "镜头不存在"})
+            continue
+
+        result = await _export_shot_to_dir(shot, output_dir, shots_dir)
+        results.append(result)
+        if "path" in result:
+            success_count += 1
+
+    if success_count == 0:
+        error_msgs = [r.get("error", "未知错误") for r in results if "error" in r]
+        raise HTTPException(status_code=400, detail=f"导出失败: {'; '.join(error_msgs)}")
+
+    return {
+        "success": True,
+        "total": len(req.shot_ids),
+        "exported": success_count,
+        "output_dir": output_dir,
+        "results": results,
+    }
 
 
 async def _export_shot_to_dir(shot: dict, output_dir: str, shots_dir: str) -> dict:
