@@ -225,6 +225,7 @@ async function openPreview(shotId, index) {
                     </div>
                     <button class="pv-btn-mute" id="pvMuteBtn" onclick="event.stopPropagation();togglePreviewMute()" title="静音 (M)">${pvMuted ? '🔇' : '🔊'}</button>
                     <button class="pv-btn-speed ${pvPlaybackRate !== 1 ? 'is-speed-changed' : ''}" id="pvSpeedBtn" onclick="event.stopPropagation();cyclePlaybackRate()" title="倍速 (R)">${pvPlaybackRate === 1 ? '1x' : pvPlaybackRate + 'x'}</button>
+                    <button class="pv-btn-continuous ${pvContinuousPlay ? 'is-active' : ''}" id="pvContinuousBtn" onclick="event.stopPropagation();toggleContinuousPlay()" title="连续播放 (C)">${pvContinuousPlay ? '🔁 连播' : '🔁'}</button>
                 </div>
 
                 <!-- 播放器区域 -->
@@ -452,7 +453,7 @@ function buildTimelineHTML() {
                  onclick="event.stopPropagation();jumpToSameSourceShot(${i})"
                  data-index="${i}"
                  title="#${s.index + 1} · ${s.timecode_display || ''}">
-                <img src="${getFrameUrl(s.frame_file)}" alt="" loading="lazy">
+                <img src="${getFrameUrl(s)}" alt="" loading="lazy">
             </div>
         `;
     }
@@ -587,6 +588,28 @@ function updateMuteBtn() {
     }
 }
 
+/**
+ * 切换连续播放
+ */
+function toggleContinuousPlay() {
+    pvContinuousPlay = !pvContinuousPlay;
+    localStorage.setItem('pv_continuous_play', pvContinuousPlay ? 'true' : 'false');
+    updateContinuousPlayBtn();
+    showToast(pvContinuousPlay ? '连续播放: 开' : '连续播放: 关');
+}
+
+/**
+ * 更新连续播放按钮显示
+ */
+function updateContinuousPlayBtn() {
+    const btn = document.getElementById('pvContinuousBtn');
+    if (btn) {
+        btn.textContent = pvContinuousPlay ? '🔁 连播' : '🔁';
+        btn.classList.toggle('is-active', pvContinuousPlay);
+        btn.title = pvContinuousPlay ? '关闭连续播放 (C)' : '连续播放 (C)';
+    }
+}
+
 function updatePvPlayBtn(isPlaying) {
     const btn = document.getElementById('pvPlayBtn');
     const text = isPlaying ? '⏸' : '▶';
@@ -651,6 +674,21 @@ function startBoundaryWatch() {
                 updatePvPlayBtn(false);
                 updatePvProgress();
                 pvBoundaryRAF = null;
+
+                // ★ 连续播放：自动跳转下一镜头
+                if (pvContinuousPlay && !pvEditMode) {
+                    const isLast = currentPreviewIndex < 0 || currentPreviewIndex >= allShots.length - 1;
+                    if (isLast) {
+                        showToast('已播放到最后一个镜头');
+                    } else if (document.getElementById('previewOverlay')) {
+                        setTimeout(() => {
+                            if (document.getElementById('previewOverlay')) {
+                                navigatePreview(1);
+                            }
+                        }, 100);
+                    }
+                }
+
                 return;
             }
         }
@@ -846,9 +884,28 @@ async function saveEdit() {
                 listShot.duration = result.duration;
             }
 
+            // ★ 入出点变了 → mid_frame 变了 → 后端已重新生成缩略图
+            // 写入版本号，强制前端所有位置（网格/时间轴/选择栏）刷新
+            if (shot.frame_file && typeof bumpFrameVersion === 'function') {
+                bumpFrameVersion(shot.frame_file);
+            }
+
             // 更新标题栏时长
             const shotDur = document.querySelector('.pv-header-title .shot-dur');
             if (shotDur) shotDur.textContent = formatDuration(result.duration);
+
+            // ★ 同步刷新网格和同源时间轴缩略图（使用新版本号）
+            if (typeof renderGrid === 'function') {
+                renderGrid();
+            }
+            // 同源镜头列表中对应条目也需刷新缩略图
+            const ssShot = sameSourceShots.find(s => s.id === shot.id);
+            if (ssShot) {
+                ssShot.start_time = result.start_time;
+                ssShot.end_time = result.end_time;
+                ssShot.duration = result.duration;
+                refreshTimeline();
+            }
 
             showToast('裁剪已保存 ✓', 'success');
             exitEditMode(true);
@@ -910,6 +967,10 @@ async function saveTrimIfNeeded() {
                 listShot.start_time = result.start_time;
                 listShot.end_time = result.end_time;
                 listShot.duration = result.duration;
+            }
+            // ★ 入出点变了 → 后端已重新生成缩略图，写入版本号破除缓存
+            if (shot.frame_file && typeof bumpFrameVersion === 'function') {
+                bumpFrameVersion(shot.frame_file);
             }
             showToast('裁剪已保存', 'success');
         }
@@ -977,6 +1038,15 @@ async function splitCurrentShot() {
             const shotA = result.shot_a;
             const shotB = result.shot_b;
 
+            // ★ 打上缓存破坏标记 — 强制浏览器重新加载新生成的缩略图
+            // 同时写入全局 frameVersionMap，确保后续 loadShots() 覆盖 allShots 后 URL 仍带版本号
+            const bust = Date.now();
+            shotA._cacheBust = bust;
+            shotB._cacheBust = bust;
+            if (typeof bumpFrameVersion === 'function') {
+                bumpFrameVersion(shotA.frame_file, shotB.frame_file);
+            }
+
             // 从 allShots 中移除原镜头
             const origIdx = allShots.findIndex(s => s.id === removedId);
             if (origIdx >= 0) {
@@ -991,13 +1061,17 @@ async function splitCurrentShot() {
             const pvWindow = document.getElementById('pvWindow');
             if (pvWindow) pvWindow.classList.remove('edit-mode');
 
+            // 强制刷新同源镜头列表（清空缓存，让 switchPreviewTo 从后端重新加载）
+            sameSourceShots = [];
+            sameSourceIndex = -1;
+
             // 切换预览到拆分后的第一个镜头
             const newIndex = allShots.findIndex(s => s.id === shotA.id);
             await switchPreviewTo(shotA, newIndex >= 0 ? newIndex : origIdx);
 
-            // 刷新网格
+            // 刷新网格 — await 确保 renderGrid 完成后再显示 toast，避免竞态导致缩略图缺失
             if (typeof loadShots === 'function') {
-                loadShots();
+                await loadShots();
             }
 
             showToast('镜头已拆分 ✓', 'success');
@@ -1195,6 +1269,9 @@ async function switchPreviewTo(shot, listIndex) {
 
     // —— 更新播放按钮状态 ——
     updatePvPlayBtn(false);
+
+    // —— 同步连续播放按钮状态 ——
+    updateContinuousPlayBtn();
 
     // —— 更新时间码 ——
     const tcCurrent = document.querySelector('#pvTimecode .tc-current');
@@ -1423,6 +1500,11 @@ function onPreviewKeyDown(e) {
         case 'R':
             e.preventDefault();
             cyclePlaybackRate();
+            break;
+        case 'c':
+        case 'C':
+            e.preventDefault();
+            toggleContinuousPlay();
             break;
     }
 }

@@ -23,8 +23,13 @@ def _get_active_project_or_fail() -> str:
 
 
 @router.get("/frames/{filename}")
-async def get_frame(filename: str):
-    """获取关键帧 JPEG 图片"""
+async def get_frame(filename: str, v: Optional[str] = Query(None)):
+    """
+    获取关键帧 JPEG 图片。
+    ★ 缓存策略：
+    - 带 ?v= 版本参数：长缓存 + immutable（前端已通过版本号打破缓存，文件内容与 URL 一一对应）
+    - 不带 ?v=：no-cache（浏览器必须向服务器验证，避免拆分/合并等操作后残留旧图）
+    """
     project_id = _get_active_project_or_fail()
     proj_dir = get_project_dir(project_id)
     frame_path = os.path.join(proj_dir, "frames", filename)
@@ -32,16 +37,21 @@ async def get_frame(filename: str):
     if not os.path.exists(frame_path):
         raise HTTPException(status_code=404, detail="帧文件不存在")
 
+    if v:
+        cache_header = "public, max-age=31536000, immutable"
+    else:
+        cache_header = "no-cache, must-revalidate"
+
     return FileResponse(
         frame_path,
         media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": cache_header},
     )
 
 
 @router.get("/saved_frames/{filename}")
-async def get_saved_frame(filename: str):
-    """获取已保存的静帧"""
+async def get_saved_frame(filename: str, v: Optional[str] = Query(None)):
+    """获取已保存的静帧（缓存策略同 /frames）"""
     project_id = _get_active_project_or_fail()
     proj_dir = get_project_dir(project_id)
     frame_path = os.path.join(proj_dir, "saved_frames", filename)
@@ -49,10 +59,15 @@ async def get_saved_frame(filename: str):
     if not os.path.exists(frame_path):
         raise HTTPException(status_code=404, detail="帧文件不存在")
 
+    if v:
+        cache_header = "public, max-age=31536000, immutable"
+    else:
+        cache_header = "no-cache, must-revalidate"
+
     return FileResponse(
         frame_path,
         media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": cache_header},
     )
 
 

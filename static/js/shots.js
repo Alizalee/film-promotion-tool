@@ -155,7 +155,8 @@ function renderGrid() {
         const duration = formatDuration(shot.duration || 0);
         const shotType = shot.shot_type || '';
         const shotTypeLabel = shotType ? `<span class="shot-hover-tag shot-type-label">${shotType}</span>` : '';
-        const frameUrl = getFrameUrl(shot.frame_file);
+        // ★ 传 shot 对象而非字符串，保留 _cacheBust 字段，确保缓存版本号不丢失
+        const frameUrl = getFrameUrl(shot);
 
         return `
             <div class="shot-card ${selectMode ? 'select-mode' : ''} ${isFav ? 'is-favorited' : ''} ${isSelected ? 'is-selected' : ''}" 
@@ -360,6 +361,8 @@ async function updateVideoSourceTags() {
         const filename = vpath.split('/').pop().split('\\').pop();
         const shortName = filename.length > 18 ? filename.substring(0, 15) + '...' : filename;
         const isChecked = sourceVideoFilters.size === 0 || sourceVideoFilters.has(vpath);
+        // ★ 排他性选中态：sourceVideoFilters 仅含此一项时高亮
+        const isSoloActive = sourceVideoFilters.size === 1 && sourceVideoFilters.has(vpath);
 
         // 构建 tooltip 信息
         const detail = videoDetails[vpath];
@@ -374,13 +377,12 @@ async function updateVideoSourceTags() {
         const safeTooltip = escapeJsString(tooltipText);
 
         return `
-            <div class="sidebar-item ${isChecked ? 'checked' : ''}" 
+            <div class="sidebar-item ${isChecked ? 'checked' : ''} ${isSoloActive ? 'solo-active' : ''}" 
                  data-video-path="${escapeHtml(vpath)}"
-                 onclick="toggleVideoSourceFilter('${safeVpath}')" 
                  onmouseenter="showVideoTooltip(event, '${safeTooltip}')"
                  onmouseleave="hideVideoTooltip()">
-                <div class="sidebar-checkbox">✓</div>
-                <span class="sidebar-label">${escapeHtml(shortName)}</span>
+                <div class="sidebar-checkbox" onclick="event.stopPropagation();toggleVideoSourceFilter('${safeVpath}')">✓</div>
+                <span class="sidebar-label" onclick="event.stopPropagation();selectSingleVideoSource('${safeVpath}')" ondblclick="event.stopPropagation();renameVideoItem('${safeVpath}', '${safeFilename}', this)">${escapeHtml(shortName)}</span>
                 <span class="sidebar-item-delete" onclick="event.stopPropagation();deleteVideoItem('${safeVpath}', '${safeFilename}')" title="删除此视频">✕</span>
             </div>
         `;
@@ -389,18 +391,151 @@ async function updateVideoSourceTags() {
     // ★ 孤儿片段分组（使用全量数据判断，确保取消勾选后选项不会消失）
     if (orphanCount > 0) {
         const isOrphanChecked = sourceVideoFilters.size === 0 || sourceVideoFilters.has('__orphan__');
+        const isOrphanSolo = sourceVideoFilters.size === 1 && sourceVideoFilters.has('__orphan__');
         html += `
-            <div class="sidebar-item ${isOrphanChecked ? 'checked' : ''}" 
-                 data-video-path="__orphan__"
-                 onclick="toggleVideoSourceFilter('__orphan__')">
-                <div class="sidebar-checkbox">✓</div>
-                <span class="sidebar-label">其他片段</span>
+            <div class="sidebar-item ${isOrphanChecked ? 'checked' : ''} ${isOrphanSolo ? 'solo-active' : ''}" 
+                 data-video-path="__orphan__">
+                <div class="sidebar-checkbox" onclick="event.stopPropagation();toggleVideoSourceFilter('__orphan__')">✓</div>
+                <span class="sidebar-label" onclick="event.stopPropagation();selectSingleVideoSource('__orphan__')">其他片段</span>
                 <span class="sidebar-badge">${orphanCount}</span>
             </div>
         `;
     }
 
     container.innerHTML = html;
+    updateToggleButtonState();
+}
+
+/**
+ * 重命名视频源 — 双击文件名触发内联编辑
+ */
+function renameVideoItem(vpath, currentFilename, labelEl) {
+    // 防止重复触发
+    if (labelEl.querySelector('.video-rename-input')) return;
+
+    // 隐藏 tooltip
+    hideVideoTooltip();
+
+    // 获取不含扩展名的文件名主体
+    const dotIdx = currentFilename.lastIndexOf('.');
+    const baseName = dotIdx > 0 ? currentFilename.substring(0, dotIdx) : currentFilename;
+    const ext = dotIdx > 0 ? currentFilename.substring(dotIdx) : '';
+
+    // 禁用父级 sidebar-item 的 tooltip 事件（避免 DOM 操作导致 blur）
+    const sidebarItem = labelEl.closest('.sidebar-item');
+    if (sidebarItem) {
+        sidebarItem.removeAttribute('onmouseenter');
+        sidebarItem.removeAttribute('onmouseleave');
+        sidebarItem.removeAttribute('onclick');
+    }
+
+    // 创建输入框
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'video-rename-input';
+    input.value = baseName;
+    input.setAttribute('data-ext', ext);
+
+    // 替换 label 内容
+    const originalText = labelEl.textContent;
+    labelEl.textContent = '';
+    labelEl.appendChild(input);
+
+    // 阻止点击事件冒泡（防止触发 toggleVideoSourceFilter）
+    input.addEventListener('click', e => e.stopPropagation());
+    input.addEventListener('dblclick', e => e.stopPropagation());
+    input.addEventListener('mousedown', e => e.stopPropagation());
+
+    // 延迟 focus，确保 DOM 稳定后再聚焦，避免立即 blur
+    requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+    });
+
+    let submitted = false;
+    // 保护期：进入编辑后 500ms 内忽略 blur，防止自动退出
+    let blurProtected = true;
+    setTimeout(() => { blurProtected = false; }, 500);
+
+    async function submitRename() {
+        if (submitted) return;
+        submitted = true;
+
+        const newName = input.value.trim();
+        if (!newName || newName === baseName) {
+            // 未修改，恢复原文本
+            restoreLabel();
+            return;
+        }
+
+        // 前端基本校验
+        const illegal = /[/\\:*?"<>|]/;
+        if (illegal.test(newName)) {
+            showToast('文件名包含非法字符', 'error');
+            restoreLabel();
+            return;
+        }
+
+        // 调用 API
+        try {
+            const result = await API.renameVideo(vpath, newName);
+            if (result.success) {
+                // 更新前端状态
+                const oldPath = result.old_path;
+                const newPath = result.new_path;
+
+                // 更新 videoPaths
+                const idx = videoPaths.indexOf(oldPath);
+                if (idx !== -1) videoPaths[idx] = newPath;
+
+                // 更新 sourceVideoFilters
+                if (sourceVideoFilters.has(oldPath)) {
+                    sourceVideoFilters.delete(oldPath);
+                    sourceVideoFilters.add(newPath);
+                }
+
+                showToast('重命名成功', 'success');
+                updateVideoSourceTags();
+                loadShots();
+            } else {
+                showToast(result.detail || '重命名失败', 'error');
+                restoreLabel();
+            }
+        } catch (e) {
+            showToast('重命名失败: ' + e.message, 'error');
+            restoreLabel();
+        }
+    }
+
+    function cancelRename() {
+        if (submitted) return;
+        submitted = true;
+        restoreLabel();
+    }
+
+    function restoreLabel() {
+        labelEl.textContent = originalText;
+        // 重新渲染整个视频源列表以恢复事件绑定
+        updateVideoSourceTags();
+    }
+
+    input.addEventListener('keydown', e => {
+        e.stopPropagation();
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            submitRename();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelRename();
+        }
+    });
+
+    input.addEventListener('blur', () => {
+        // 保护期内忽略 blur，防止刚进入编辑就自动退出
+        if (blurProtected) return;
+        // 短延迟防止 blur 和 keydown 冲突
+        setTimeout(() => { if (!submitted) cancelRename(); }, 150);
+    });
 }
 
 /**
@@ -476,6 +611,52 @@ function toggleVideoSourceFilter(vpath) {
     }
     updateVideoSourceTags();
     loadShots();
+}
+
+/**
+ * 排他性筛选 — 只显示指定视频的镜头（点击视频名触发）
+ */
+function selectSingleVideoSource(vpath) {
+    // 如果当前已经是排他选中该视频，则恢复全选
+    if (sourceVideoFilters.size === 1 && sourceVideoFilters.has(vpath)) {
+        sourceVideoFilters.clear();
+    } else {
+        sourceVideoFilters.clear();
+        sourceVideoFilters.add(vpath);
+    }
+    updateVideoSourceTags();
+    loadShots();
+}
+
+/**
+ * 切换全选/全不选（智能判断当前状态）
+ */
+function toggleAllVideoSources() {
+    if (sourceVideoFilters.size === 0) {
+        // 当前全选 → 全不选
+        sourceVideoFilters.clear();
+        sourceVideoFilters.add('__none__');
+    } else {
+        // 当前非全选 → 全选
+        sourceVideoFilters.clear();
+    }
+    updateVideoSourceTags();
+    loadShots();
+}
+
+/**
+ * 更新全选/全不选按钮的文字状态
+ */
+function updateToggleButtonState() {
+    const btn = document.getElementById('videoSourceToggleBtn');
+    if (!btn) return;
+    if (sourceVideoFilters.size === 0) {
+        btn.textContent = '全不选';
+        btn.title = '取消所有勾选';
+    } else {
+        btn.textContent = '全选';
+        btn.title = '勾选所有视频源';
+    }
 }
 
 /**
@@ -765,7 +946,7 @@ function updateSelectionBar() {
         if (!shot) return '';
         return `
             <div class="selection-bar-thumb" title="#${shot.index + 1}">
-                <img src="${getFrameUrl(shot.frame_file)}" alt="" loading="lazy">
+                <img src="${getFrameUrl(shot)}" alt="" loading="lazy">
                 <div class="remove-btn" onclick="event.stopPropagation();toggleShotSelect('${shot.id}')">✕</div>
             </div>
         `;
@@ -986,7 +1167,7 @@ function startMergeDrag(card, shotId, startX, startY) {
     // 创建跟随鼠标的幽灵缩略图
     _mergeGhostEl = document.createElement('div');
     _mergeGhostEl.className = 'merge-ghost';
-    const frameUrl = getFrameUrl(shot.frame_file);
+    const frameUrl = getFrameUrl(shot);
     _mergeGhostEl.innerHTML = `<img src="${frameUrl}" alt="">`;
     _mergeGhostEl.style.left = startX + 'px';
     _mergeGhostEl.style.top = startY + 'px';
@@ -1134,8 +1315,8 @@ function showMergeConfirm(shotA, shotB) {
         [shotA, shotB] = [shotB, shotA];
     }
 
-    const frameA = getFrameUrl(shotA.frame_file);
-    const frameB = getFrameUrl(shotB.frame_file);
+    const frameA = getFrameUrl(shotA);
+    const frameB = getFrameUrl(shotB);
     const mergedDur = formatDuration(shotB.end_time - shotA.start_time);
     const timeRange = `${formatTimecode(shotA.start_time)} → ${formatTimecode(shotB.end_time)}`;
 
@@ -1192,6 +1373,11 @@ async function executeMerge(shotIdA, shotIdB) {
     try {
         const result = await API.mergeShots(shotIdA, shotIdB);
         if (result.success) {
+            // ★ 写入全局版本号，破除合并后新封面的浏览器缓存
+            const mergedFrameFile = result.merged_shot && result.merged_shot.frame_file;
+            if (mergedFrameFile && typeof bumpFrameVersion === 'function') {
+                bumpFrameVersion(mergedFrameFile);
+            }
             showToast('镜头合并成功', 'success');
             await loadShots();
             updateVideoSourceTags();

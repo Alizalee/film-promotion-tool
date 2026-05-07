@@ -91,5 +91,10 @@ class BatchAnalyzeRequest(BaseModel):
     threshold: Optional[int] = None
 
 
+class VideoRenameRequest(BaseModel):
+    video_path: str       # 原视频的绝对路径
+    new_name: str         # 新文件名（不含路径，不含扩展名）
+
+
 class BatchDeleteShotsRequest(BaseModel):
     shot_ids: list[str]

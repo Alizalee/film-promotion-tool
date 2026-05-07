@@ -654,8 +654,25 @@ async def trim_shot(req: TrimShotRequest):
             # 更新时间码显示
             shot["timecode_display"] = _frame_to_display_timecode(shot["start_frame"], fps)
 
-            # 清除该镜头的缓存裁剪视频（入出点变了，旧缓存已过期）
+            # ★ 标记为用户手动编辑过 — 重新分析时不会被覆盖
+            shot["user_edited"] = True
+
             proj_dir = get_project_dir(project_id)
+
+            # ★ 入出点变了 → 重新提取中间帧并覆盖缩略图文件
+            # 否则前端显示的封面仍是旧 mid_frame 的画面，与新镜头范围不匹配
+            video_path = shot.get("source_video", "")
+            frame_file = shot.get("frame_file", "")
+            if video_path and os.path.exists(video_path) and frame_file:
+                new_frame = extract_frame(video_path, shot["mid_frame"])
+                if new_frame is not None:
+                    frames_dir = os.path.join(proj_dir, "frames")
+                    os.makedirs(frames_dir, exist_ok=True)
+                    frame_path = os.path.join(frames_dir, frame_file)
+                    save_thumbnail(new_frame, frame_path)
+                    logger.info(f"裁剪后重新生成封面: {shot['id']} → F{shot['mid_frame']}")
+
+            # 清除该镜头的缓存裁剪视频（入出点变了，旧缓存已过期）
             shots_cache_dir = os.path.join(proj_dir, "shots")
             if os.path.isdir(shots_cache_dir):
                 import glob
@@ -900,6 +917,8 @@ async def merge_shots(req: MergeShotsRequest):
         "saved": False,
         "frame_file": frame_file,
         "source_video": video_path,
+        # ★ 标记为用户手动编辑过 — 重新分析时不会被覆盖
+        "user_edited": True,
     }
 
     # 删除旧帧文件（跳过与新封面同名的文件，避免合并后的封面被误删）
@@ -992,7 +1011,7 @@ async def split_shot(req: SplitShotRequest):
     # 提取镜头 A 中间帧
     frame_a = extract_frame(video_path, a_mid_frame)
     if frame_a is not None:
-        save_frame_jpeg(frame_a, os.path.join(frames_dir, a_frame_file))
+        save_thumbnail(frame_a, os.path.join(frames_dir, a_frame_file))
 
     shot_a = {
         "id": a_id,
@@ -1010,6 +1029,8 @@ async def split_shot(req: SplitShotRequest):
         "saved": False,
         "frame_file": a_frame_file,
         "source_video": video_path,
+        # ★ 标记为用户手动编辑过
+        "user_edited": True,
     }
 
     # ── 构建镜头 B（后半段） ──
@@ -1027,7 +1048,7 @@ async def split_shot(req: SplitShotRequest):
     # 提取镜头 B 中间帧
     frame_b = extract_frame(video_path, b_mid_frame)
     if frame_b is not None:
-        save_frame_jpeg(frame_b, os.path.join(frames_dir, b_frame_file))
+        save_thumbnail(frame_b, os.path.join(frames_dir, b_frame_file))
 
     shot_b = {
         "id": b_id,
@@ -1045,6 +1066,8 @@ async def split_shot(req: SplitShotRequest):
         "saved": False,
         "frame_file": b_frame_file,
         "source_video": video_path,
+        # ★ 标记为用户手动编辑过
+        "user_edited": True,
     }
 
     # ── 对拆分后的两个镜头分别做人脸检测 + 景别分类 ──

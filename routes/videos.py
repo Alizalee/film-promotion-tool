@@ -12,7 +12,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query
 from typing import Optional
 
-from models.schemas import AnalyzeRequest, AnalyzeAppendRequest, VideoDeleteRequest, ReanalyzeRequest, BatchAnalyzeRequest
+from models.schemas import AnalyzeRequest, AnalyzeAppendRequest, VideoDeleteRequest, VideoRenameRequest, ReanalyzeRequest, BatchAnalyzeRequest
 from models.constants import (
     UPLOADS_DIR,
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -398,14 +398,29 @@ def _batch_background_task(project_id: str, video_paths: list, threshold: int):
     全部拆分完成后，启动深度分析（人脸/景别/动态值）。
     """
     try:
-        total = len(video_paths)
+        # ★ 验证文件存在性，过滤无效路径
+        valid_paths = []
+        for vp in video_paths:
+            abs_vp = os.path.abspath(vp)
+            if os.path.exists(abs_vp):
+                valid_paths.append(abs_vp)
+            else:
+                logger.warning(f"后台批量分析: 文件不存在，跳过: {vp}")
+
+        if not valid_paths:
+            logger.error("后台批量分析: 所有视频文件均不存在")
+            _update_bg_status("done", 0, False, project_id,
+                              current_video="", split_queue=0, split_done=0)
+            return
+
+        total = len(valid_paths)
         _update_bg_status("splitting", 0, True, project_id,
-                          current_video=os.path.basename(video_paths[0]),
+                          current_video=os.path.basename(valid_paths[0]),
                           split_queue=total, split_done=0)
 
         all_new_video_paths = []
 
-        for i, vpath in enumerate(video_paths):
+        for i, vpath in enumerate(valid_paths):
             if _cancel_flag.is_set():
                 break
 
@@ -487,6 +502,28 @@ def _batch_background_task(project_id: str, video_paths: list, threshold: int):
 
             except Exception as e:
                 logger.error(f"后台拆分 {os.path.basename(vpath)} 失败: {e}", exc_info=True)
+                # ★ 即使拆分失败，也确保视频路径被注册到 video_paths 中
+                # 这样前端视频列表中能看到该文件，用户可以后续重试分析
+                try:
+                    project_data = load_project_data(project_id) or {
+                        "video_path": None,
+                        "video_paths": [],
+                        "shots": [],
+                        "fps": 0,
+                        "total_frames": 0,
+                    }
+                    existing_vpaths = project_data.get("video_paths", [])
+                    if vpath not in existing_vpaths:
+                        existing_vpaths.append(vpath)
+                        project_data["video_paths"] = existing_vpaths
+                        save_project_data(project_id, project_data)
+                        update_project_info(
+                            project_id,
+                            video_count=len(existing_vpaths),
+                        )
+                        logger.info(f"拆分失败但已注册视频路径: {os.path.basename(vpath)}")
+                except Exception as inner_e:
+                    logger.error(f"注册失败视频路径时出错: {inner_e}")
                 continue
 
             # 更新拆分完成计数
@@ -545,7 +582,8 @@ async def analyze_batch_bg(req: BatchAnalyzeRequest):
     for vp in req.video_paths:
         _validate_video_path(vp)
 
-    threshold = req.threshold or DEFAULT_THRESHOLD
+    # 注意：threshold 为 0 时合法（表示最粗切分），不能用 `or` 回退
+    threshold = req.threshold if req.threshold is not None else DEFAULT_THRESHOLD
 
     # _start_batch_background 内部会先停止旧任务
     _start_batch_background(project_id, req.video_paths, threshold)
@@ -558,27 +596,38 @@ async def check_duplicate_videos(req: dict):
     """
     检查待上传的视频文件名是否与当前项目中已有视频重复。
     请求体: { "filenames": ["a.mp4", "b.mov", ...] }
-    返回: { "duplicates": ["a.mp4"] }  — 重复的文件名列表
+    返回: { "duplicates": ["a.mp4"], "orphan_files": ["a.mp4"] }
+    - duplicates: 已在项目视频列表或 uploads 目录中存在的文件名
+    - orphan_files: 物理文件存在于 uploads 目录但不在项目 video_paths 中的文件（可直接分析）
     """
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
 
     filenames = req.get("filenames", [])
     if not filenames or not project_data:
-        return {"duplicates": []}
+        return {"duplicates": [], "orphan_files": []}
 
-    # 获取项目中已有视频的文件名集合
-    existing_names = set()
+    # 获取项目中已登记视频的文件名集合
+    registered_names = set()
     for vpath in project_data.get("video_paths", []):
-        existing_names.add(os.path.basename(vpath))
+        registered_names.add(os.path.basename(vpath))
 
-    # 同时检查 uploads 目录中是否存在同名文件
+    # 检查 uploads 目录中物理存在的文件
+    disk_names = set()
     if os.path.exists(UPLOADS_DIR):
         for fname in os.listdir(UPLOADS_DIR):
-            existing_names.add(fname)
+            disk_names.add(fname)
+
+    # 合并检查
+    existing_names = registered_names | disk_names
 
     duplicates = [fn for fn in filenames if fn in existing_names]
-    return {"duplicates": duplicates}
+    # orphan_files: 物理文件在 uploads 目录中存在，但未注册到项目 video_paths 中
+    # 这些文件可以直接用其路径做分析，无需重新上传
+    orphan_files = [fn for fn in filenames if fn in disk_names and fn not in registered_names]
+    # 返回 orphan 文件的绝对路径，前端可直接用于分析
+    orphan_paths = [os.path.abspath(os.path.join(UPLOADS_DIR, fn)) for fn in orphan_files]
+    return {"duplicates": duplicates, "orphan_files": orphan_files, "orphan_paths": orphan_paths}
 
 
 @router.post("/upload_video")
@@ -621,7 +670,7 @@ async def analyze_video(req: AnalyzeRequest):
     # 清除取消标志
     _cancel_flag.clear()
 
-    threshold = req.threshold or DEFAULT_THRESHOLD
+    threshold = req.threshold if req.threshold is not None else DEFAULT_THRESHOLD
     video_path = os.path.abspath(req.video_path)
 
     # 场景检测（已降采样加速）
@@ -690,7 +739,7 @@ async def analyze_append(req: AnalyzeAppendRequest):
     # 清除取消标志
     _cancel_flag.clear()
 
-    threshold = req.threshold or DEFAULT_THRESHOLD
+    threshold = req.threshold if req.threshold is not None else DEFAULT_THRESHOLD
     video_path = os.path.abspath(req.video_path)
 
     # 加载已有数据
@@ -763,10 +812,15 @@ async def analyze_append(req: AnalyzeAppendRequest):
     }
 
 
-def _reanalyze_background_task(project_id: str, video_paths: list, threshold: int, favorite_ranges: list, orphan_shots: list):
+def _reanalyze_background_task(project_id: str, video_paths: list, threshold: int, favorite_ranges: list, orphan_shots: list, edited_shots: list):
     """
     后台重新分析任务 — 用新灵敏度重新切分所有视频的镜头。
     在后台线程中执行，避免阻塞 FastAPI 事件循环。
+
+    ★ 保留用户手动编辑过的镜头（user_edited=True）：
+    - 已编辑镜头的时间区间从重新切分结果中剔除（避免重叠）
+    - 已编辑镜头的帧文件不会被删除
+    - 最终结果 = 新切分镜头 + 已编辑镜头 + 孤儿镜头（按视频 + 时间排序）
     """
     try:
         total = len(video_paths)
@@ -778,14 +832,37 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
         proj_dir = get_project_dir(project_id)
         frames_dir = os.path.join(proj_dir, "frames")
 
-        # 清空旧帧文件
+        # ★ 已编辑镜头的帧文件名集合（清理帧目录时需保留）
+        protected_frames = {
+            s.get("frame_file", "") for s in edited_shots if s.get("frame_file")
+        }
+
+        # 清空旧帧文件（但保留已编辑镜头的帧）
         if os.path.exists(frames_dir):
-            shutil.rmtree(frames_dir)
+            for fname in os.listdir(frames_dir):
+                if fname in protected_frames:
+                    continue
+                try:
+                    os.remove(os.path.join(frames_dir, fname))
+                except OSError:
+                    pass
         os.makedirs(frames_dir, exist_ok=True)
 
         # 清空有效区域缓存（重新分析时应重新检测黑边）
         from services.face_detect import _effective_region_cache
         _effective_region_cache.clear()
+
+        # ★ 按视频源分组构建"已占用时间区间" — 用于过滤重叠的新场景
+        # key: source_video, value: list of (start_time, end_time)
+        from collections import defaultdict
+        edited_ranges_by_video = defaultdict(list)
+        for s in edited_shots:
+            src = s.get("source_video", "")
+            if not src or src == "__orphan__":
+                continue
+            edited_ranges_by_video[src].append(
+                (float(s.get("start_time", 0)), float(s.get("end_time", 0)))
+            )
 
         # 对所有视频重新进行场景检测 + 快速构建
         all_new_shots = []
@@ -810,6 +887,28 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
 
                 if _cancel_flag.is_set():
                     break
+
+                # ★ 过滤与已编辑镜头重叠的场景
+                occupied = edited_ranges_by_video.get(vpath, [])
+                if occupied:
+                    def _overlaps(scene_start_frame, scene_end_frame):
+                        s_t = scene_start_frame / fps
+                        e_t = scene_end_frame / fps
+                        for o_s, o_e in occupied:
+                            # 有任意重叠即过滤（容差 1 帧）
+                            tol = 1.0 / fps
+                            if s_t < o_e - tol and e_t > o_s + tol:
+                                return True
+                        return False
+
+                    filtered_scenes = [
+                        sc for sc in scenes
+                        if not _overlaps(sc[0], sc[1])
+                    ]
+                    skipped = len(scenes) - len(filtered_scenes)
+                    if skipped > 0:
+                        logger.info(f"重分析 {os.path.basename(vpath)}: 跳过 {skipped} 个与已编辑镜头重叠的场景")
+                    scenes = filtered_scenes
 
                 new_shots = build_shots_fast(
                     scenes=scenes,
@@ -837,9 +936,17 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
         # ★ 不再手动标记 shot.favorite — 由 get_shots 根据 favorites 数组动态匹配
         # favorites 数组不在重分析时修改，保持用户原有的收藏记录
 
-        # ★ 保留孤儿 shots（source_video == "__orphan__"），它们不受重分析影响
-        # 重新排 index
-        final_shots = all_new_shots + orphan_shots
+        # ★ 合并：新切分镜头 + 已编辑镜头 + 孤儿镜头
+        # 按视频顺序 + start_frame 排序（孤儿镜头放最后）
+        video_order = {vp: idx for idx, vp in enumerate(video_paths)}
+
+        combined = list(all_new_shots) + list(edited_shots)
+        combined.sort(key=lambda s: (
+            video_order.get(s.get("source_video", ""), 999),
+            s.get("start_frame", 0),
+        ))
+
+        final_shots = combined + orphan_shots
         for i, s in enumerate(final_shots):
             s["index"] = i
 
@@ -856,7 +963,10 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
             shot_count=len(final_shots),
         )
 
-        logger.info(f"重新分析拆分完成: {len(all_new_shots)} 个镜头 + {len(orphan_shots)} 个孤儿镜头")
+        logger.info(
+            f"重新分析拆分完成: {len(all_new_shots)} 新镜头 + "
+            f"{len(edited_shots)} 已编辑镜头 + {len(orphan_shots)} 孤儿镜头"
+        )
 
         # 全部拆分完成，进入深度分析阶段
         if not _cancel_flag.is_set():
@@ -871,14 +981,14 @@ def _reanalyze_background_task(project_id: str, video_paths: list, threshold: in
                           current_video="", split_queue=0, split_done=0)
 
 
-def _start_reanalyze_background(project_id: str, video_paths: list, threshold: int, favorite_ranges: list, orphan_shots: list):
+def _start_reanalyze_background(project_id: str, video_paths: list, threshold: int, favorite_ranges: list, orphan_shots: list, edited_shots: list):
     """启动后台重新分析线程（先停止旧任务）"""
     global _bg_task_thread
     _stop_running_bg_task()
     _cancel_flag.clear()
     t = threading.Thread(
         target=_reanalyze_background_task,
-        args=(project_id, video_paths, threshold, favorite_ranges, orphan_shots),
+        args=(project_id, video_paths, threshold, favorite_ranges, orphan_shots, edited_shots),
         daemon=True,
     )
     _bg_task_thread = t
@@ -891,6 +1001,7 @@ async def reanalyze_all(req: ReanalyzeRequest):
     重新分析 — 用新灵敏度阈值重新切分所有视频的镜头。
     ★ 快速返回模式：验证参数 → 启动后台线程 → 立即返回。
     保留用户的收藏状态（通过时间范围匹配旧 shot 映射 favorite）。
+    ★ 保留用户手动编辑过的镜头（user_edited=True）—— 拆分/合并/裁剪产生的镜头不会被覆盖。
     """
     project_id = _get_active_project_or_fail()
     project_data = load_project_data(project_id)
@@ -902,19 +1013,36 @@ async def reanalyze_all(req: ReanalyzeRequest):
     if not video_paths:
         raise HTTPException(status_code=400, detail="没有视频可以重新分析")
 
-    threshold = req.threshold or DEFAULT_THRESHOLD
+    threshold = req.threshold if req.threshold is not None else DEFAULT_THRESHOLD
 
     # ★ 从独立的 favorites 数组读取收藏信息（传给后台线程用于恢复标记）
     favorite_ranges = list(project_data.get("favorites", []))
 
+    all_shots = project_data.get("shots", [])
+
     # ★ 保留不在 video_paths 中的孤儿 shots（source_video == "__orphan__"）
     orphan_shots = [
-        s for s in project_data.get("shots", [])
+        s for s in all_shots
         if s.get("source_video") == "__orphan__"
     ]
 
+    # ★ 保留用户手动编辑过的镜头（user_edited=True，非孤儿）
+    # 其源视频必须仍在 video_paths 中，否则视为孤立数据一并保留到 orphan
+    video_path_set = set(video_paths)
+    edited_shots = []
+    for s in all_shots:
+        if not s.get("user_edited"):
+            continue
+        if s.get("source_video") == "__orphan__":
+            continue
+        if s.get("source_video") not in video_path_set:
+            # 源视频已被移除，当作孤儿保留
+            orphan_shots.append(s)
+            continue
+        edited_shots.append(s)
+
     # ★ 启动后台线程处理重切分 + 深度分析，接口立即返回
-    _start_reanalyze_background(project_id, video_paths, threshold, favorite_ranges, orphan_shots)
+    _start_reanalyze_background(project_id, video_paths, threshold, favorite_ranges, orphan_shots, edited_shots)
 
     return {
         "success": True,
@@ -1038,6 +1166,103 @@ async def get_videos():
         })
 
     return {"videos": videos}
+
+
+@router.post("/videos/rename")
+async def rename_video(req: VideoRenameRequest):
+    """
+    重命名视频文件 — 修改磁盘文件名并更新项目数据中所有引用。
+    new_name 为不含路径、不含扩展名的新文件名主体。
+    """
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+
+    if not project_data:
+        raise HTTPException(status_code=404, detail="项目数据不存在")
+
+    video_path = req.video_path
+    new_name = req.new_name.strip()
+
+    # 校验：原路径必须在项目中
+    video_paths = project_data.get("video_paths", [])
+    if video_path not in video_paths:
+        raise HTTPException(status_code=404, detail="该视频不在项目中")
+
+    # 校验：新名称不能为空
+    if not new_name:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
+    # 校验：不能包含非法字符
+    illegal_chars = set('/\\:*?"<>|')
+    if any(c in illegal_chars for c in new_name):
+        raise HTTPException(status_code=400, detail="文件名包含非法字符")
+
+    # 保持原扩展名
+    old_dir = os.path.dirname(video_path)
+    old_ext = os.path.splitext(video_path)[1]
+    new_filename = new_name + old_ext
+    new_path = os.path.join(old_dir, new_filename)
+
+    # 校验：新路径不能与现有文件冲突（排除自身）
+    if os.path.abspath(new_path) != os.path.abspath(video_path) and os.path.exists(new_path):
+        raise HTTPException(status_code=409, detail="目标文件名已存在")
+
+    # 如果名称没有实质变化，直接返回
+    if os.path.abspath(new_path) == os.path.abspath(video_path):
+        return {"success": True, "old_path": video_path, "new_path": video_path}
+
+    # ★ 停止后台分析线程（释放文件句柄，避免重命名失败）
+    _stop_running_bg_task()
+
+    # 执行磁盘文件重命名
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="视频文件不存在于磁盘")
+
+    try:
+        os.rename(video_path, new_path)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"重命名失败: {e}")
+
+    new_path_abs = os.path.abspath(new_path)
+
+    # 更新 project_data 中所有引用
+    # 1. video_paths
+    project_data["video_paths"] = [
+        new_path_abs if vp == video_path else vp
+        for vp in project_data.get("video_paths", [])
+    ]
+
+    # 2. video_path（最近活跃视频）
+    if project_data.get("video_path") == video_path:
+        project_data["video_path"] = new_path_abs
+
+    # 3. shots 中的 source_video
+    for shot in project_data.get("shots", []):
+        if shot.get("source_video") == video_path:
+            shot["source_video"] = new_path_abs
+
+    # 4. favorites 中的 source_video
+    for fav in project_data.get("favorites", []):
+        if fav.get("source_video") == video_path:
+            fav["source_video"] = new_path_abs
+
+    # 保存
+    try:
+        save_project_data(project_id, project_data)
+    except Exception as e:
+        # 回滚：恢复文件名
+        try:
+            os.rename(new_path, video_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"保存项目数据失败，已回滚文件名: {e}")
+
+    # ★ 如果有未完成的镜头分析，重新启动后台分析
+    pending = sum(1 for s in project_data.get("shots", []) if not s.get("face_detected", False))
+    if pending > 0:
+        _start_background_analysis(project_id, project_data["video_paths"])
+
+    return {"success": True, "old_path": video_path, "new_path": new_path_abs}
 
 
 def _migrate_favorites(project_data: dict) -> bool:

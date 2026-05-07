@@ -31,6 +31,7 @@ let currentPreviewIndex = -1;
 let previewMode = 'play'; // play | freeze | trim
 let pvMuted = false; // 预览弹窗静音状态（跨镜头保持）
 let pvPlaybackRate = parseFloat(localStorage.getItem('pv_playback_rate')) || 1.0; // 倍速（跨镜头保持）
+let pvContinuousPlay = localStorage.getItem('pv_continuous_play') === 'true'; // 连续播放（跨镜头保持）
 
 // 裁剪
 let trimStart = 0;
@@ -64,7 +65,7 @@ let fps = 24;
 let settingsOpen = false;
 let projectDropdownOpen = false;
 let isAnalyzing = false;
-let threshold = 27;
+let threshold = 50;  // 镜头切分灵敏度（0-100），值越高越灵敏、切分越细
 let thresholdChanged = false;  // 灵敏度是否被修改过（用于显示重新分析按钮）
 let searchDebounceTimer = null;
 let sidebarCollapsed = false;  // 侧边栏是否折叠
@@ -80,6 +81,22 @@ let pvBoundaryRAF = null; // requestAnimationFrame ID，用于精确出点检测
 let prevDebugShot = null;               // 上一个镜头数据（用于差异对比）
 let debugPanelVisible = localStorage.getItem('pv_debug_visible') === 'true';  // 面板是否可见
 let titleClickTimestamps = [];          // 标题点击时间戳（用于三连击检测）
+
+// ★ 帧图片版本号表 — 用于破除浏览器缓存
+// key: frame_file 文件名，value: 版本号（时间戳）
+// 拆分/合并/裁剪等操作后，前端在此写入新版本；getFrameUrl 自动附加到 URL
+const frameVersionMap = new Map();
+
+/**
+ * 标记若干 frame_file 为"新版本"，后续 getFrameUrl 会自动带上 ?v= 参数
+ * @param {...string} frameFiles - 帧文件名
+ */
+function bumpFrameVersion(...frameFiles) {
+    const v = Date.now();
+    for (const f of frameFiles) {
+        if (f) frameVersionMap.set(f, v);
+    }
+}
 
 // 后台分析
 let bgTaskPolling = false;      // 是否正在轮询后台状态

@@ -18,10 +18,11 @@ YUNET_SCORE_THRESHOLD = 0.6
 YUNET_NMS_THRESHOLD = 0.3
 YUNET_INPUT_SIZE = (320, 320)  # YuNet 默认输入尺寸
 
-# 场景检测默认阈值（AdaptiveDetector 会自动映射此值）
-DEFAULT_THRESHOLD = 27
-MIN_THRESHOLD = 10
-MAX_THRESHOLD = 60
+# 场景检测灵敏度（0-100，值越高越灵敏、切分越细；0=最粗，100=最细）
+# 后端会将此值映射为 AdaptiveDetector 的 adaptive_threshold / min_content_val / min_scene_len / window_width
+DEFAULT_THRESHOLD = 50
+MIN_THRESHOLD = 0
+MAX_THRESHOLD = 100
 
 # 人脸检测（预筛用更低阈值，宁多勿漏）
 YUNET_TRIAGE_SCORE = 0.4    # 预筛阶段用更低置信度

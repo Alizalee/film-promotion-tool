@@ -47,7 +47,7 @@ def detect_scenes(video_path: str, threshold: Optional[int] = None) -> tuple:
 
     Args:
         video_path: 视频文件路径
-        threshold: 灵敏度阈值 (10-60)，越小越灵敏，默认 27
+        threshold: 灵敏度 (0-100)，值越高越灵敏、切分越细。默认 50。
 
     Returns:
         (scene_list, fps, total_frames)
@@ -62,19 +62,33 @@ def detect_scenes(video_path: str, threshold: Optional[int] = None) -> tuple:
     fps = video.frame_rate
     total_frames = video.duration.get_frames()
 
-    # 将用户阈值（10-60 范围）映射为 AdaptiveDetector 的 adaptive_threshold
-    # 用户阈值 10（灵敏）→ adaptive 2.0,  27（默认）→ 3.0,  60（迟钝）→ 5.0
-    adaptive_th = 2.0 + (threshold - 10) * (3.0 / 50.0)
-    # 同时设置 min_content_val，防止噪声触发
-    min_cv = max(10.0, threshold * 0.5)
+    # ── 灵敏度映射 ──
+    # 用户阈值 0-100：0 = 最粗（只切大变化），100 = 最细（连微弱变化也切）
+    # 反向映射到底层参数：t 越大 → adaptive_threshold 越低、min_content_val 越低、
+    # min_scene_len 越短、window_width 越窄，整体越容易触发分镜。
+    #   t=0.0  : adaptive_th=5.5, min_cv=30, min_scene=30, window=3  (最迟钝)
+    #   t=0.5  : adaptive_th=3.5, min_cv=16, min_scene=18, window=2  (默认)
+    #   t=1.0  : adaptive_th=1.5, min_cv= 3, min_scene= 6, window=1  (最灵敏)
+    t = max(0.0, min(1.0, threshold / 100.0))
+
+    adaptive_th = 5.5 - t * 4.0                         # 5.5 → 1.5
+    min_cv = max(3.0, 30.0 - t * 27.0)                  # 30 → 3
+    min_scene = max(4, int(round(30 - t * 24)))         # 30 → 6
+    # window_width：越小越能捕获渐变，但也更易被噪声触发
+    if t < 0.35:
+        win_w = 3
+    elif t < 0.75:
+        win_w = 2
+    else:
+        win_w = 1
 
     scene_manager = SceneManager()
     scene_manager.downscale = 3  # 降采样加速场景检测
     scene_manager.add_detector(AdaptiveDetector(
         adaptive_threshold=adaptive_th,
-        min_scene_len=15,
+        min_scene_len=min_scene,
         min_content_val=min_cv,
-        window_width=2,
+        window_width=win_w,
     ))
     scene_manager.detect_scenes(video)
 

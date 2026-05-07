@@ -64,7 +64,10 @@
 
         <!-- 视频源多选列表 -->
         <div class="sidebar-section sidebar-section-scroll" id="videoSourceSection">
-            <div class="sidebar-section-title">视频源</div>
+            <div class="sidebar-section-title video-source-title-row">
+                <span>视频源</span>
+                <span class="video-source-toggle" id="videoSourceToggleBtn" onclick="toggleAllVideoSources()" title="取消所有勾选">全不选</span>
+            </div>
             <div id="videoSourceList">
                 <!-- 动态渲染 checkbox 列表 -->
             </div>
@@ -73,10 +76,14 @@
         <!-- 底部：仅灵敏度滑块 -->
         <div class="sidebar-bottom">
             <div class="sidebar-sensitivity">
-                <label>镜头切分灵敏度</label>
+                <div class="sidebar-sensitivity-head">
+                    <label>镜头切分灵敏度</label>
+                    <span class="sidebar-slider-val" id="thresholdValue">50</span>
+                </div>
                 <div class="sidebar-slider-row">
-                    <input type="range" id="thresholdSlider" min="10" max="60" value="27" oninput="onThresholdChange(this.value)">
-                    <span class="sidebar-slider-val" id="thresholdValue">27</span>
+                    <span class="slider-label-hint">0</span>
+                    <input type="range" id="thresholdSlider" min="0" max="100" step="1" value="50" oninput="onThresholdChange(this.value)">
+                    <span class="slider-label-hint">100</span>
                 </div>
             </div>
         </div>

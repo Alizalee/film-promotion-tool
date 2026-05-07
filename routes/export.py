@@ -64,34 +64,82 @@ class ExportToDirRequest(BaseModel):
 
 
 # ── 选择导出目录（系统文件夹选择对话框）──────────────────────
+import platform
+
+def _pick_folder_macos(initial_dir: str) -> str:
+    """macOS 使用 osascript 弹出原生目录选择对话框（避免 tkinter 线程问题）"""
+    # 构建 AppleScript
+    if initial_dir and os.path.isdir(initial_dir):
+        # AppleScript 需要 POSIX path 格式
+        script = f'''
+        set defaultDir to POSIX file "{initial_dir}" as alias
+        try
+            set selectedFolder to choose folder with prompt "选择导出保存目录" default location defaultDir
+            return POSIX path of selectedFolder
+        on error
+            return ""
+        end try
+        '''
+    else:
+        script = '''
+        try
+            set selectedFolder to choose folder with prompt "选择导出保存目录"
+            return POSIX path of selectedFolder
+        on error
+            return ""
+        end try
+        '''
+
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    path = result.stdout.strip()
+    # osascript 返回的路径末尾可能有 /，统一去掉
+    if path and path.endswith("/") and len(path) > 1:
+        path = path[:-1]
+    return path
+
+
+def _pick_folder_tkinter(initial_dir: str) -> str:
+    """Windows/Linux 使用 tkinter 弹出目录选择对话框"""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    root.update()
+
+    selected = filedialog.askdirectory(
+        title="选择导出保存目录",
+        initialdir=initial_dir,
+    )
+    root.destroy()
+    return selected or ""
+
+
 @router.get("/select_export_dir")
 async def select_export_dir():
     """
     弹出系统原生文件夹选择对话框，返回用户选择的目录路径。
-    在线程中执行以避免阻塞事件循环。
+    macOS 使用 osascript（避免 tkinter 在非主线程中无法工作的问题）。
+    Windows/Linux 使用 tkinter。
     """
     global _last_export_dir
 
-    def _pick_folder() -> str:
-        import tkinter as tk
-        from tkinter import filedialog
+    initial_dir = _last_export_dir if _last_export_dir and os.path.isdir(_last_export_dir) else os.path.expanduser("~")
 
-        root = tk.Tk()
-        root.withdraw()                    # 隐藏主窗口
-        root.attributes("-topmost", True)  # 置顶，防止对话框被浏览器遮住
-        root.update()
-
-        initial_dir = _last_export_dir if _last_export_dir and os.path.isdir(_last_export_dir) else os.path.expanduser("~")
-
-        selected = filedialog.askdirectory(
-            title="选择导出保存目录",
-            initialdir=initial_dir,
-        )
-        root.destroy()
-        return selected or ""
-
-    loop = asyncio.get_event_loop()
-    path = await loop.run_in_executor(None, _pick_folder)
+    if platform.system() == "Darwin":
+        # macOS: 使用 osascript，在线程池中执行避免阻塞事件循环
+        loop = asyncio.get_event_loop()
+        path = await loop.run_in_executor(None, _pick_folder_macos, initial_dir)
+    else:
+        # Windows/Linux: 使用 tkinter
+        loop = asyncio.get_event_loop()
+        path = await loop.run_in_executor(None, _pick_folder_tkinter, initial_dir)
 
     if not path:
         raise HTTPException(status_code=400, detail="用户取消了目录选择")

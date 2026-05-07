@@ -153,6 +153,15 @@ const API = {
         return res.json();
     },
 
+    async renameVideo(videoPath, newName) {
+        const res = await fetch('/api/videos/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ video_path: videoPath, new_name: newName }),
+        });
+        return res.json();
+    },
+
     // ── 镜头 ──
     async getShots(params = {}) {
         const query = new URLSearchParams();

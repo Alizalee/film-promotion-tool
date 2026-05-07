@@ -115,10 +115,13 @@ async function handleVideoFiles(files) {
     // ══════════════════════════════════════════
     const filenames = Array.from(files).map(f => f.name);
     let filesToUpload = Array.from(files);
+    let orphanPaths = []; // 物理文件存在但未注册到项目的文件路径
 
     try {
         const dupResult = await API.checkDuplicateVideos(filenames);
         const duplicates = dupResult.duplicates || [];
+        const orphanFiles = dupResult.orphan_files || []; // 文件在 uploads 目录但不在项目中
+        const orphanAbsPaths = dupResult.orphan_paths || []; // 后端返回的绝对路径
 
         if (duplicates.length > 0) {
             // 弹出确认对话框，让用户选择
@@ -136,8 +139,25 @@ async function handleVideoFiles(files) {
                     return;
                 }
                 showToast(`已跳过 ${duplicates.length} 个重复文件`, 'info');
+            } else {
+                // userChoice === 'upload' → 继续上传全部
+                // 对于 orphan_files（物理文件已存在于 uploads 但不在项目 video_paths 中），
+                // 不需要重新上传，直接用已有路径做分析即可
+                if (orphanFiles.length > 0) {
+                    const orphanSet = new Set(orphanFiles);
+                    // 从待上传列表中移除这些 orphan 文件（它们已在磁盘上）
+                    filesToUpload = filesToUpload.filter(f => !orphanSet.has(f.name));
+                    // 使用后端返回的绝对路径
+                    orphanPaths = orphanAbsPaths;
+                }
+                // 对于已注册到项目的重复文件（非 orphan），也从待上传列表中移除
+                // 因为它们的 shots 已经存在，重新上传会产生带后缀的新文件
+                const registeredDups = duplicates.filter(fn => !orphanFiles.includes(fn));
+                if (registeredDups.length > 0) {
+                    const regSet = new Set(registeredDups);
+                    filesToUpload = filesToUpload.filter(f => !regSet.has(f.name));
+                }
             }
-            // userChoice === 'upload' → 继续上传全部（包括重复的）
         }
     } catch (err) {
         console.warn('检查重复文件失败，继续上传:', err);
@@ -196,6 +216,11 @@ async function handleVideoFiles(files) {
         }
     }
 
+    // 将 orphan 文件路径（物理已存在但未注册到项目）也加入待分析列表
+    if (orphanPaths.length > 0) {
+        uploadedPaths.push(...orphanPaths);
+    }
+
     if (uploadedPaths.length === 0) {
         if (isFirstEver) {
             hideProgress();
@@ -209,10 +234,14 @@ async function handleVideoFiles(files) {
     // ══════════════════════════════════════════
     if (isFirstEver) {
         // 场景1 & 3: 项目空白 → 同步分析第1个视频的镜头拆分，立即进入主页面
-        const firstFile = filesToUpload[0];
-        const sizeMB = firstFile.size / (1024 * 1024);
+        const firstName = filesToUpload.length > 0
+            ? filesToUpload[0].name
+            : uploadedPaths[0].split('/').pop();
+        const sizeMB = filesToUpload.length > 0
+            ? filesToUpload[0].size / (1024 * 1024)
+            : 100; // orphan 文件无法获知大小，用默认估算
         const estSeconds = Math.max(5, Math.round(sizeMB * 0.15));
-        showAnalyzeProgress(`正在分析 ${firstFile.name}…`, estSeconds);
+        showAnalyzeProgress(`正在分析 ${firstName}…`, estSeconds);
         showProgress(50);
 
         try {
@@ -237,7 +266,7 @@ async function handleVideoFiles(files) {
                 allProjects = projData.projects || [];
                 await initProjectView();
 
-                showToast(`${firstFile.name} 镜头拆分完成，检测到 ${result.total_shots || 0} 个镜头`, 'success');
+                showToast(`${firstName} 镜头拆分完成，检测到 ${result.total_shots || 0} 个镜头`, 'success');
 
                 // 如果还有剩余视频 → 全部丢给后台批量分析
                 if (uploadedPaths.length > 1) {
@@ -251,7 +280,7 @@ async function handleVideoFiles(files) {
                     startBgTaskPolling();
                 }
             } else {
-                showToast(`分析 ${firstFile.name} 失败`, 'error');
+                showToast(`分析 ${firstName} 失败`, 'error');
                 hideProgress();
                 isAnalyzing = false;
             }

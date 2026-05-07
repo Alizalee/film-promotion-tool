@@ -111,9 +111,38 @@ function showConfirm(title, message, confirmText, onConfirm, isDanger = false) {
 
 /**
  * 获取帧图片 URL
+ * @param {string|object} frameFileOrShot - 帧文件名，或 shot 对象（自动提取 frame_file）
+ * @param {number|string} [cacheBust] - 可选缓存破坏参数（版本号或时间戳）
+ *
+ * 版本号优先级：
+ * 1. 显式传入的 cacheBust
+ * 2. shot 对象的 _cacheBust 字段
+ * 3. 全局 frameVersionMap 中该 frame_file 的版本号（由 bumpFrameVersion 写入）
  */
-function getFrameUrl(frameFile) {
-    return `/api/frames/${encodeURIComponent(frameFile)}`;
+function getFrameUrl(frameFileOrShot, cacheBust) {
+    let frameFile;
+    let bust = cacheBust;
+
+    if (typeof frameFileOrShot === 'object' && frameFileOrShot !== null) {
+        // 传入整个 shot 对象：自动提取 frame_file 和 _cacheBust
+        frameFile = frameFileOrShot.frame_file || '';
+        if (bust === undefined) {
+            bust = frameFileOrShot._cacheBust;
+        }
+    } else {
+        frameFile = frameFileOrShot || '';
+    }
+
+    // ★ 从全局版本号表查（兜底，保证即使 shot 对象被后端返回覆盖，URL 仍带版本号）
+    if (bust === undefined && typeof frameVersionMap !== 'undefined' && frameFile) {
+        bust = frameVersionMap.get(frameFile);
+    }
+
+    let url = `/api/frames/${encodeURIComponent(frameFile)}`;
+    if (bust) {
+        url += `?v=${encodeURIComponent(bust)}`;
+    }
+    return url;
 }
 
 /**
