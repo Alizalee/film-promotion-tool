@@ -44,44 +44,21 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# ── 分析取消机制 ──
-_cancel_flag = threading.Event()
-
-# ── 后台任务状态 ──
-_bg_task_status = {
-    "running": False,
-    "stage": "idle",      # idle | splitting | analyzing | done
-    "progress": 0,        # 进度百分比 0-100
-    "project_id": None,
-    "current_video": "",   # 当前正在拆分的视频文件名
-    "split_queue": 0,      # 拆分队列剩余数
-    "split_done": 0,       # 已完成拆分的视频数
-    "analyzed_count": 0,   # 已分析完成的镜头数
-    "total_count": 0,      # 镜头总数
-}
-_bg_task_lock = threading.Lock()
-_bg_task_thread: threading.Thread | None = None  # 当前后台线程引用
-
-
-def _stop_running_bg_task(timeout: float = 30):
-    """
-    如果有后台任务正在运行，取消它并等待线程退出。
-    确保新任务启动前不会与旧任务产生竞争。
-    """
-    global _bg_task_thread
-    with _bg_task_lock:
-        is_running = _bg_task_status["running"]
-    if is_running and _bg_task_thread and _bg_task_thread.is_alive():
-        _cancel_flag.set()
-        _bg_task_thread.join(timeout=timeout)
-        # join 后重置
-        _cancel_flag.clear()
-    _bg_task_thread = None
-
-
-def is_cancelled() -> bool:
-    """检查是否已请求取消"""
-    return _cancel_flag.is_set()
+# ── 后台任务管理 — 使用统一的 bg_task 服务 ──
+from services import bg_task as _bg_task_module
+from services.bg_task import (
+    is_cancelled,
+    set_cancel,
+    clear_cancel,
+    stop_running_bg_task as _stop_running_bg_task,
+    update_status as _update_bg_status,
+    get_status as _get_bg_status,
+    _cancel_flag,
+    _bg_task_lock,
+    _bg_task_status,
+)
+# 兼容：videos.py 中多处使用 global _bg_task_thread 赋值
+_bg_task_thread = None
 
 
 def _get_active_project_or_fail() -> str:
@@ -100,27 +77,6 @@ def _validate_video_path(video_path: str):
     if ext not in SUPPORTED_VIDEO_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"不支持的视频格式: {ext}")
 
-
-def _update_bg_status(stage: str, progress: int = 0, running: bool = True, project_id: str = None,
-                      current_video: str = None, split_queue: int = None, split_done: int = None,
-                      analyzed_count: int = None, total_count: int = None):
-    """线程安全地更新后台任务状态"""
-    with _bg_task_lock:
-        _bg_task_status["stage"] = stage
-        _bg_task_status["progress"] = progress
-        _bg_task_status["running"] = running
-        if project_id is not None:
-            _bg_task_status["project_id"] = project_id
-        if current_video is not None:
-            _bg_task_status["current_video"] = current_video
-        if split_queue is not None:
-            _bg_task_status["split_queue"] = split_queue
-        if split_done is not None:
-            _bg_task_status["split_done"] = split_done
-        if analyzed_count is not None:
-            _bg_task_status["analyzed_count"] = analyzed_count
-        if total_count is not None:
-            _bg_task_status["total_count"] = total_count
 
 
 def _read_sample_frames(cap, start_frame: int, end_frame: int) -> dict:
@@ -1291,65 +1247,8 @@ async def _pre_clip_favorite_shots(shots: list, proj_dir: str):
     为收藏镜头预裁剪独立 MP4 文件（在源视频删除前调用）。
     裁剪后的文件保存在项目 shots/ 目录下，并更新镜头的 clip_file 字段。
     """
-    shots_dir = os.path.join(proj_dir, "shots")
-    os.makedirs(shots_dir, exist_ok=True)
-
-    for shot in shots:
-        if not shot.get("favorite"):
-            continue
-        # 如果已有 clip_file 且文件存在，跳过
-        existing_clip = shot.get("clip_file", "")
-        if existing_clip and os.path.exists(os.path.join(shots_dir, existing_clip)):
-            continue
-
-        video_path = shot.get("source_video", "")
-        if not video_path or not os.path.exists(video_path):
-            continue
-
-        start_time = shot.get("start_time", 0)
-        duration = shot.get("duration", 0)
-        if duration <= 0:
-            continue
-
-        clip_filename = f"{shot['id']}_clip.mp4"
-        clip_path = os.path.join(shots_dir, clip_filename)
-
-        # 使用双 -ss 精确裁剪策略
-        safe_start = max(0, start_time - 5)
-        offset = round(start_time - safe_start, 6)
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(safe_start),
-            "-i", video_path,
-            "-ss", str(offset),
-            "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-avoid_negative_ts", "make_zero",
-            clip_path,
-        ]
-
-        try:
-            def _run_ffmpeg():
-                return subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-            result = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg)
-
-            if result.returncode == 0 and os.path.exists(clip_path):
-                shot["clip_file"] = clip_filename
-                logger.info(f"预裁剪收藏镜头: {shot['id']} → {clip_filename}")
-            else:
-                logger.warning(f"预裁剪失败: {shot['id']}: {result.stderr.decode(errors='replace')[:100]}")
-        except Exception as e:
-            logger.warning(f"预裁剪异常: {shot['id']}: {e}")
+    from services.clip_service import pre_clip_favorite_shots
+    await pre_clip_favorite_shots(shots, proj_dir)
 
 
 @router.post("/videos/delete")

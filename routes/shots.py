@@ -1,11 +1,13 @@
 """镜头数据 API 路由 — 完整实现"""
 import os
+import time
 import cv2
 import asyncio
 import subprocess
 import logging
+import numpy as np
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from typing import Optional
 
 from models.schemas import (
@@ -24,6 +26,8 @@ from services.project_manager import (
     get_project_dir,
     update_project_info,
 )
+from services.clip_service import clip_single_shot
+from services.shot_enrichment import enrich_shot_with_face_info
 
 logger = logging.getLogger(__name__)
 from services.scene_detect import extract_frame, save_frame_jpeg, save_thumbnail, _video_hash, _frame_to_timecode, _frame_to_display_timecode
@@ -45,6 +49,9 @@ def _apply_favorites_to_shots(shots: list, favorites: list):
     根据 favorites 列表动态给 shots 标记 favorite 字段。
     匹配规则：source_video 相同 + shot 中点落在 favorite 时间范围内。
     对于 __orphan__ 类型的 shot，直接保留其已有的 favorite 标记。
+
+    优化：将 favorites 按 source_video 分组为 dict，匹配从 O(shots*favorites) 降为 O(shots*k)，
+    k 为单个视频源的 favorites 数量（通常远小于总 favorites 数）。
     """
     if not favorites:
         # 没有 favorites → 清除所有非孤儿 shot 的 favorite 标记
@@ -52,6 +59,14 @@ def _apply_favorites_to_shots(shots: list, favorites: list):
             if shot.get("source_video") != "__orphan__":
                 shot["favorite"] = False
         return
+
+    # 按 source_video 分组索引 favorites
+    from collections import defaultdict
+    fav_by_video = defaultdict(list)
+    for fav in favorites:
+        fav_by_video[fav.get("source_video", "")].append(
+            (fav.get("start_time", 0), fav.get("end_time", 0))
+        )
 
     for shot in shots:
         # 孤儿 shot 保持自身的 favorite 状态不变
@@ -61,13 +76,87 @@ def _apply_favorites_to_shots(shots: list, favorites: list):
         shot_mid = (shot.get("start_time", 0) + shot.get("end_time", 0)) / 2
         shot_src = shot.get("source_video", "")
         matched = False
-        for fav in favorites:
-            if fav.get("source_video") != shot_src:
-                continue
-            if fav.get("start_time", 0) <= shot_mid <= fav.get("end_time", 0):
+        for fav_start, fav_end in fav_by_video.get(shot_src, []):
+            if fav_start <= shot_mid <= fav_end:
                 matched = True
                 break
         shot["favorite"] = matched
+
+
+@router.post("/refresh_frame")
+async def refresh_frame(req: dict = Body(...)):
+    """
+    前端检测到帧文件 404 时自动调用 — 重新从视频提取帧并保存。
+    请求体: { "shot_id": "xxx" }
+    """
+    shot_id = req.get("shot_id")
+    if not shot_id:
+        raise HTTPException(status_code=400, detail="缺少 shot_id")
+
+    project_id = _get_active_project_or_fail()
+    project_data = load_project_data(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="项目数据不存在")
+
+    shot = None
+    for s in project_data.get("shots", []):
+        if s["id"] == shot_id:
+            shot = s
+            break
+    if not shot:
+        raise HTTPException(status_code=404, detail="镜头不存在")
+
+    video_path = shot.get("source_video", "")
+    if not video_path or not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="源视频文件不存在")
+
+    proj_dir = get_project_dir(project_id)
+    frames_dir = os.path.join(proj_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    frame_file = shot.get("frame_file", "")
+    if not frame_file:
+        raise HTTPException(status_code=400, detail="镜头缺少 frame_file")
+
+    frame_path = os.path.join(frames_dir, frame_file)
+
+    # 多点采样重试提取
+    start_frame = shot.get("start_frame", 0)
+    end_frame = shot.get("end_frame", start_frame + 1)
+    mid_frame = shot.get("mid_frame", (start_frame + end_frame) // 2)
+
+    candidates = [
+        mid_frame,
+        (start_frame + end_frame) // 2,
+        start_frame + (end_frame - start_frame) // 4,
+        start_frame + 3 * (end_frame - start_frame) // 4,
+        start_frame + 1,
+        max(end_frame - 1, start_frame),
+    ]
+
+    frame = None
+    used_frame_num = mid_frame
+    for fn in candidates:
+        fn = max(start_frame, min(fn, end_frame - 1))
+        f = extract_frame(video_path, fn)
+        if f is not None and f.mean() > 5:  # 非全黑
+            frame = f
+            used_frame_num = fn
+            break
+
+    if frame is None:
+        # 最后兜底：灰色占位图
+        frame = np.full((180, 320, 3), 64, dtype=np.uint8)
+
+    save_thumbnail(frame, frame_path)
+    logger.info(f"refresh_frame 重新提取: {shot_id} → F{used_frame_num}")
+
+    # 更新 mid_frame（如果变了）
+    if used_frame_num != shot.get("mid_frame"):
+        shot["mid_frame"] = used_frame_num
+        save_project_data(project_id, project_data)
+
+    return {"success": True, "frame_file": frame_file, "_cacheBust": int(time.time() * 1000)}
 
 
 @router.get("/shots")
@@ -148,6 +237,22 @@ async def get_shots(
     total_all_global = len(all_shots)
     favorite_count = sum(1 for s in all_shots if s.get("favorite"))
 
+    # ★ per_video_counts：按视频源分组的全量计数（不受筛选影响）
+    # 前端可直接使用，无需额外请求
+    from collections import defaultdict
+    per_video_counts = defaultdict(lambda: {"total": 0, "favorite": 0, "types": {}})
+    for s in all_shots:
+        src = s.get("source_video", "")
+        if src == "__orphan__":
+            continue
+        pvc = per_video_counts[src]
+        pvc["total"] += 1
+        if s.get("favorite"):
+            pvc["favorite"] += 1
+        st = s.get("shot_type", "")
+        if st:
+            pvc["types"][st] = pvc["types"].get(st, 0) + 1
+
     # ★ 分类计数的基准集：应用除景别筛选外的其他筛选条件
     # 这样当用户选"已收藏"时，分类标签的计数只反映收藏镜头中各分类的数量
     base_shots = list(all_shots)
@@ -185,6 +290,7 @@ async def get_shots(
         "total_all_global": total_all_global,
         "favorite_count": favorite_count,
         "shot_type_counts": shot_type_counts,
+        "per_video_counts": dict(per_video_counts),
         "motion_data_ready": motion_data_ready,
         "shot_type_data_ready": shot_type_data_ready,
     }
@@ -261,48 +367,22 @@ async def detect_faces_on_demand():
 
     detected_count = 0
     person_count = 0
+    proj_dir = get_project_dir(project_id)
 
     for vpath, shot_list in video_shots.items():
         if not os.path.exists(vpath):
             continue
 
-        # ★ 获取视频有效区域（去黑边），传入人脸检测
         effective_region = get_effective_region_cached(vpath)
 
         for shot in shot_list:
-            # ★ 多帧采样检测（25%、50%、75% 位置），替代只看首帧
-            face_info = detect_face_info_multi_frame(
+            enrich_shot_with_face_info(
+                shot=shot,
                 video_path=vpath,
-                start_frame=shot.get("start_frame", 0),
-                end_frame=shot.get("end_frame", shot.get("start_frame", 0) + 1),
-                sample_count=3,
+                project_id=project_id,
+                proj_dir=proj_dir,
                 effective_region=effective_region,
             )
-            shot["has_person"] = bool(face_info["has_person"])
-            shot["face_ratio"] = float(face_info["face_ratio"])
-            shot["good_composition"] = bool(face_info["good_composition"])
-            shot["face_count"] = int(face_info.get("face_count", 0))
-            shot["per_frame_debug"] = face_info.get("per_frame", {})
-            # ★ 补写构图安全性字段（裁头/安全区/黑边）
-            shot["face_cropped"] = bool(face_info.get("face_cropped", False))
-            shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
-            shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
-            shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
-
-            # ★ 根据最优帧更新封面（推镜头等场景，选最佳帧作为封面）
-            best_fn = face_info.get("best_frame_num")
-            _update_cover_frame(shot, best_fn, vpath, project_id)
-
-            # ★ 构图瑕疵标记（不影响分类，仅供前端展示）
-            issues = []
-            if shot["face_cropped"]:
-                issues.append("裁头")
-            if not shot["face_in_safe_zone"]:
-                issues.append("贴边")
-            shot["composition_issue"] = "/".join(issues)
-
-            # 标记已检测（缓存标志）
-            shot["face_detected"] = True
             detected_count += 1
             if shot["has_person"]:
                 person_count += 1
@@ -359,68 +439,46 @@ async def detect_shot_types():
             if vpath:
                 video_shots[vpath].append(shot)
 
+        proj_dir = get_project_dir(project_id)
         for vpath, shot_list in video_shots.items():
             if not os.path.exists(vpath):
                 continue
 
-            # ★ 获取视频有效区域（去黑边），传入人脸检测
             effective_region = get_effective_region_cached(vpath)
 
             for shot in shot_list:
-                # ★ 多帧采样检测（25%、50%、75% 位置）
-                face_info = detect_face_info_multi_frame(
+                enrich_shot_with_face_info(
+                    shot=shot,
                     video_path=vpath,
-                    start_frame=shot.get("start_frame", 0),
-                    end_frame=shot.get("end_frame", shot.get("start_frame", 0) + 1),
-                    sample_count=3,
+                    project_id=project_id,
+                    proj_dir=proj_dir,
                     effective_region=effective_region,
                 )
-                shot["has_person"] = bool(face_info["has_person"])
-                shot["face_ratio"] = float(face_info["face_ratio"])
-                shot["good_composition"] = bool(face_info["good_composition"])
-                shot["face_count"] = int(face_info.get("face_count", 0))
-                shot["per_frame_debug"] = face_info.get("per_frame", {})
-                # ★ 补写构图安全性字段（裁头/安全区/黑边）
-                shot["face_cropped"] = bool(face_info.get("face_cropped", False))
-                shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
-                shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
-                shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
-
-                # ★ 根据最优帧更新封面
-                best_fn = face_info.get("best_frame_num")
-                _update_cover_frame(shot, best_fn, vpath, project_id)
-
-                # ★ 构图瑕疵标记
-                issues = []
-                if shot["face_cropped"]:
-                    issues.append("裁头")
-                if not shot["face_in_safe_zone"]:
-                    issues.append("贴边")
-                shot["composition_issue"] = "/".join(issues)
-                shot["face_detected"] = True
 
     # 所有 pending 镜头进行分类（基于 face_count + face_ratio + 构图安全性）
     detected_count = 0
     for shot in pending:
-        face_count = shot.get("face_count", 0)
-        face_ratio = shot.get("face_ratio", 0.0)
-        face_cropped = shot.get("face_cropped", False)
-        face_in_safe_zone = shot.get("face_in_safe_zone", True)
-        shot["shot_type"] = classify_shot_label(
-            face_count=face_count,
-            face_ratio=face_ratio,
-            face_cropped=face_cropped,
-            face_in_safe_zone=face_in_safe_zone,
-        )
-        # ★ 补写构图瑕疵标记（可能之前人脸检测时没有写入）
-        if not shot.get("composition_issue") and shot.get("composition_issue") != "":
-            issues = []
-            if face_cropped:
-                issues.append("裁头")
-            if not face_in_safe_zone:
-                issues.append("贴边")
-            shot["composition_issue"] = "/".join(issues)
-        shot["shot_type_detected"] = True
+        if not shot.get("shot_type_detected", False):
+            # enrich 已经做了分类，但对于只缺 shot_type 的情况补一下
+            face_count = shot.get("face_count", 0)
+            face_ratio = shot.get("face_ratio", 0.0)
+            face_cropped = shot.get("face_cropped", False)
+            face_in_safe_zone = shot.get("face_in_safe_zone", True)
+            shot["shot_type"] = classify_shot_label(
+                face_count=face_count,
+                face_ratio=face_ratio,
+                face_cropped=face_cropped,
+                face_in_safe_zone=face_in_safe_zone,
+            )
+            # 补写构图瑕疵标记
+            if not shot.get("composition_issue") and shot.get("composition_issue") != "":
+                issues = []
+                if face_cropped:
+                    issues.append("裁头")
+                if not face_in_safe_zone:
+                    issues.append("贴边")
+                shot["composition_issue"] = "/".join(issues)
+            shot["shot_type_detected"] = True
         detected_count += 1
 
     # 写回缓存
@@ -428,71 +486,6 @@ async def detect_shot_types():
 
     return {"detected": detected_count + migrated, "cached": False}
 
-
-async def _clip_single_shot(shot: dict, proj_dir: str):
-    """
-    为单个镜头预裁剪独立 MP4 文件。
-    裁剪后的文件保存在项目 shots/ 目录下，并更新镜头的 clip_file 字段。
-    """
-    shots_dir = os.path.join(proj_dir, "shots")
-    os.makedirs(shots_dir, exist_ok=True)
-
-    # 如果已有 clip_file 且文件存在，跳过
-    existing_clip = shot.get("clip_file", "")
-    if existing_clip and os.path.exists(os.path.join(shots_dir, existing_clip)):
-        return True
-
-    video_path = shot.get("source_video", "")
-    if not video_path or not os.path.exists(video_path):
-        return False
-
-    start_time = shot.get("start_time", 0)
-    duration = shot.get("duration", 0)
-    if duration <= 0:
-        return False
-
-    clip_filename = f"{shot['id']}_clip.mp4"
-    clip_path = os.path.join(shots_dir, clip_filename)
-
-    # 使用双 -ss 精确裁剪策略
-    safe_start = max(0, start_time - 5)
-    offset = round(start_time - safe_start, 6)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(safe_start),
-        "-i", video_path,
-        "-ss", str(offset),
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "18",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-avoid_negative_ts", "make_zero",
-        clip_path,
-    ]
-
-    try:
-        def _run_ffmpeg():
-            return subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg)
-
-        if result.returncode == 0 and os.path.exists(clip_path):
-            shot["clip_file"] = clip_filename
-            logger.info(f"预裁剪镜头: {shot['id']} → {clip_filename}")
-            return True
-        else:
-            logger.warning(f"预裁剪失败: {shot['id']}: {result.stderr.decode(errors='replace')[:100]}")
-            return False
-    except Exception as e:
-        logger.warning(f"预裁剪异常: {shot['id']}: {e}")
-        return False
 
 
 @router.post("/favorite")
@@ -571,7 +564,7 @@ async def toggle_favorite(req: FavoriteRequest):
     # ★ 收藏时，如果源视频存在且没有 clip_file，立即预裁剪
     clip_ready = False
     if req.favorite and target_shot:
-        clip_ready = await _clip_single_shot(target_shot, proj_dir)
+        clip_ready = await clip_single_shot(target_shot, proj_dir)
 
     save_project_data(project_id, project_data)
     return {
@@ -617,7 +610,7 @@ async def ensure_favorite_clips():
             changed = True
 
         # 尝试预裁剪
-        success = await _clip_single_shot(shot, proj_dir)
+        success = await clip_single_shot(shot, proj_dir)
         if success:
             clipped += 1
             changed = True
@@ -688,7 +681,7 @@ async def trim_shot(req: TrimShotRequest):
 
             # ★ 如果是收藏镜头，立即重新生成 clip_file
             if shot.get("favorite"):
-                await _clip_single_shot(shot, proj_dir)
+                await clip_single_shot(shot, proj_dir)
 
             save_project_data(project_id, project_data)
             return {
@@ -834,60 +827,13 @@ async def merge_shots(req: MergeShotsRequest):
     frame = extract_frame(video_path, new_mid_frame)
     motion_score = max(shot_a.get("motion_score", 0), shot_b.get("motion_score", 0))
 
+    proj_dir = get_project_dir(project_id)
+    frames_dir = os.path.join(proj_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
     if frame is not None:
-        proj_dir = get_project_dir(project_id)
-        frames_dir = os.path.join(proj_dir, "frames")
-        os.makedirs(frames_dir, exist_ok=True)
         save_thumbnail(frame, os.path.join(frames_dir, frame_file))
 
-    # ── 对合并后的镜头做独立的人脸检测 + 景别分类 ──
-    effective_region = get_effective_region_cached(video_path)
-    face_info = detect_face_info_multi_frame(
-        video_path=video_path,
-        start_frame=new_start_frame,
-        end_frame=new_end_frame,
-        sample_count=3,
-        effective_region=effective_region,
-    )
-
-    # ★ 根据最优帧更新封面
-    best_fn = face_info.get("best_frame_num")
-    if best_fn is not None and best_fn != new_mid_frame:
-        best_frame_img = extract_frame(video_path, best_fn)
-        if best_frame_img is not None:
-            new_mid_frame = best_fn
-            if not proj_dir:
-                proj_dir = get_project_dir(project_id)
-            frames_dir = os.path.join(proj_dir, "frames")
-            os.makedirs(frames_dir, exist_ok=True)
-            save_thumbnail(best_frame_img, os.path.join(frames_dir, frame_file))
-
-    merged_has_person = bool(face_info["has_person"])
-    merged_face_ratio = float(face_info["face_ratio"])
-    merged_good_composition = bool(face_info["good_composition"])
-    merged_face_count = int(face_info.get("face_count", 0))
-    merged_face_cropped = bool(face_info.get("face_cropped", False))
-    merged_face_in_safe_zone = bool(face_info.get("face_in_safe_zone", True))
-    merged_head_margin_ratio = float(face_info.get("head_margin_ratio", 1.0))
-    merged_has_black_bars = bool(face_info.get("has_black_bars", False))
-
-    # 构图瑕疵标记
-    issues = []
-    if merged_face_cropped:
-        issues.append("裁头")
-    if not merged_face_in_safe_zone:
-        issues.append("贴边")
-    merged_composition_issue = "/".join(issues)
-
-    # 景别分类
-    merged_shot_type = classify_shot_label(
-        face_count=merged_face_count,
-        face_ratio=merged_face_ratio,
-        face_cropped=merged_face_cropped,
-        face_in_safe_zone=merged_face_in_safe_zone,
-    )
-
-    # 构建合并后的镜头
+    # 构建合并后的镜头（先构建基础信息，再用 enrich 丰富化）
     merged_shot = {
         "id": new_id,
         "index": earlier_idx,
@@ -899,27 +845,21 @@ async def merge_shots(req: MergeShotsRequest):
         "start_time": new_start_time,
         "end_time": new_end_time,
         "duration": new_duration,
-        "has_person": merged_has_person,
-        "face_ratio": merged_face_ratio,
-        "face_count": merged_face_count,
-        "good_composition": merged_good_composition,
         "motion_score": motion_score,
-        "shot_type": merged_shot_type,
-        "face_detected": True,
-        "shot_type_detected": True,
-        "face_cropped": merged_face_cropped,
-        "face_in_safe_zone": merged_face_in_safe_zone,
-        "head_margin_ratio": merged_head_margin_ratio,
-        "has_black_bars": merged_has_black_bars,
-        "composition_issue": merged_composition_issue,
-        "per_frame_debug": face_info.get("per_frame", {}),
         "favorite": shot_a.get("favorite", False) or shot_b.get("favorite", False),
         "saved": False,
         "frame_file": frame_file,
         "source_video": video_path,
-        # ★ 标记为用户手动编辑过 — 重新分析时不会被覆盖
         "user_edited": True,
     }
+
+    # ── 对合并后的镜头做人脸检测 + 构图 + 景别分类 ──
+    enrich_shot_with_face_info(
+        shot=merged_shot,
+        video_path=video_path,
+        project_id=project_id,
+        proj_dir=proj_dir,
+    )
 
     # 删除旧帧文件（跳过与新封面同名的文件，避免合并后的封面被误删）
     proj_dir = get_project_dir(project_id)
@@ -1074,44 +1014,13 @@ async def split_shot(req: SplitShotRequest):
     effective_region = get_effective_region_cached(video_path)
 
     for new_shot in [shot_a, shot_b]:
-        face_info = detect_face_info_multi_frame(
+        enrich_shot_with_face_info(
+            shot=new_shot,
             video_path=video_path,
-            start_frame=new_shot["start_frame"],
-            end_frame=new_shot["end_frame"],
-            sample_count=3,
+            project_id=project_id,
+            proj_dir=proj_dir,
             effective_region=effective_region,
         )
-        new_shot["has_person"] = bool(face_info["has_person"])
-        new_shot["face_ratio"] = float(face_info["face_ratio"])
-        new_shot["good_composition"] = bool(face_info["good_composition"])
-        new_shot["face_count"] = int(face_info.get("face_count", 0))
-        new_shot["per_frame_debug"] = face_info.get("per_frame", {})
-        new_shot["face_cropped"] = bool(face_info.get("face_cropped", False))
-        new_shot["face_in_safe_zone"] = bool(face_info.get("face_in_safe_zone", True))
-        new_shot["head_margin_ratio"] = float(face_info.get("head_margin_ratio", 1.0))
-        new_shot["has_black_bars"] = bool(face_info.get("has_black_bars", False))
-
-        # ★ 根据最优帧更新封面
-        best_fn = face_info.get("best_frame_num")
-        _update_cover_frame(new_shot, best_fn, video_path, project_id)
-
-        # 构图瑕疵标记
-        issues = []
-        if new_shot["face_cropped"]:
-            issues.append("裁头")
-        if not new_shot["face_in_safe_zone"]:
-            issues.append("贴边")
-        new_shot["composition_issue"] = "/".join(issues)
-
-        # 景别分类
-        new_shot["shot_type"] = classify_shot_label(
-            face_count=new_shot["face_count"],
-            face_ratio=new_shot["face_ratio"],
-            face_cropped=new_shot["face_cropped"],
-            face_in_safe_zone=new_shot["face_in_safe_zone"],
-        )
-        new_shot["face_detected"] = True
-        new_shot["shot_type_detected"] = True
 
     # ── 删除原镜头帧文件 ──
     old_frame = os.path.join(frames_dir, orig_shot.get("frame_file", ""))

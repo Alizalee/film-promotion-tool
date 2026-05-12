@@ -285,4 +285,14 @@ const API = {
         });
         return res.json();
     },
+
+    // ── 帧图片修复 ──
+    async refreshFrame(shotId) {
+        const res = await fetch('/api/refresh_frame', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ shot_id: shotId }),
+        });
+        return res.json();
+    },
 };

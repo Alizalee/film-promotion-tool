@@ -2,6 +2,7 @@
 import os
 import json
 import uuid
+import copy
 import numpy as np
 from datetime import datetime
 from typing import Optional
@@ -21,6 +22,12 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 from models.constants import WORKSPACE_DIR, PROJECTS_DIR, PROJECTS_INDEX
+
+
+# ═══════════════════════════════════════════════════════════════
+# 内存缓存 — 基于 mtime 校验，避免每次请求都做 json.load()
+# ═══════════════════════════════════════════════════════════════
+_project_cache: dict = {}  # {project_id: (mtime, data)}
 
 
 def _now_str() -> str:
@@ -53,22 +60,48 @@ def get_project_dir(project_id: str) -> str:
 
 
 def load_project_data(project_id: str) -> Optional[dict]:
-    """加载某个项目的完整数据"""
+    """加载某个项目的完整数据（带 mtime 内存缓存）"""
     proj_dir = get_project_dir(project_id)
     data_file = os.path.join(proj_dir, "project.json")
-    if os.path.exists(data_file):
-        with open(data_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+    if not os.path.exists(data_file):
+        return None
+
+    try:
+        mtime = os.path.getmtime(data_file)
+    except OSError:
+        mtime = 0
+
+    cached = _project_cache.get(project_id)
+    if cached and cached[0] == mtime:
+        # 缓存命中 → 返回深拷贝，防止调用方修改影响缓存
+        return copy.deepcopy(cached[1])
+
+    with open(data_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    _project_cache[project_id] = (mtime, copy.deepcopy(data))
+    return data
 
 
 def save_project_data(project_id: str, data: dict):
-    """保存项目数据"""
+    """保存项目数据（同步更新缓存）"""
     proj_dir = get_project_dir(project_id)
     os.makedirs(proj_dir, exist_ok=True)
     data_file = os.path.join(proj_dir, "project.json")
     with open(data_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, cls=_NumpyEncoder)
+
+    # 写入后同步更新缓存
+    try:
+        mtime = os.path.getmtime(data_file)
+    except OSError:
+        mtime = 0
+    _project_cache[project_id] = (mtime, copy.deepcopy(data))
+
+
+def invalidate_project_cache(project_id: str):
+    """手动失效指定项目的缓存（外部文件变更时调用）"""
+    _project_cache.pop(project_id, None)
 
 
 def create_project(name: str, description: str = "") -> dict:

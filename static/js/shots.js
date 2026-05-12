@@ -2,6 +2,60 @@
    镜头列表 — 加载、渲染、筛选、排序、Hover 预览
    ═══════════════════════════════════════════════════ */
 
+/* ── 帧图片 404 自动修复 ── */
+const _frameRetrySet = new Set();
+let _frameRefreshQueue = [];
+let _frameRefreshRunning = 0;
+const MAX_CONCURRENT_REFRESH = 3;
+
+/**
+ * 帧图片加载失败时自动触发重新提取
+ * - 每个 shot 最多自动重试 1 次，避免死循环
+ * - 并发控制：同时最多 3 个刷新请求
+ */
+function handleFrameError(imgEl, shotId, frameFile) {
+    if (_frameRetrySet.has(shotId)) {
+        imgEl.style.display = 'none';
+        return;
+    }
+    _frameRetrySet.add(shotId);
+
+    _frameRefreshQueue.push(async () => {
+        _frameRefreshRunning++;
+        try {
+            const result = await API.refreshFrame(shotId);
+            if (result.success && result.frame_file) {
+                bumpFrameVersion(result.frame_file);
+                const newUrl = getFrameUrl(result.frame_file, result._cacheBust);
+                imgEl.src = newUrl;
+                imgEl.style.display = '';
+
+                // 同步刷新高斯模糊背景层
+                const thumbContainer = imgEl.closest('.shot-thumb');
+                if (thumbContainer) {
+                    const blurImg = thumbContainer.querySelector('.shot-thumb-blur img');
+                    if (blurImg) blurImg.src = newUrl;
+                }
+            } else {
+                imgEl.style.display = 'none';
+            }
+        } catch (e) {
+            console.warn('自动重新提取帧失败:', shotId, e);
+            imgEl.style.display = 'none';
+        }
+        _frameRefreshRunning--;
+        _processRefreshQueue();
+    });
+    _processRefreshQueue();
+}
+
+function _processRefreshQueue() {
+    while (_frameRefreshRunning < MAX_CONCURRENT_REFRESH && _frameRefreshQueue.length > 0) {
+        const task = _frameRefreshQueue.shift();
+        task();
+    }
+}
+
 /**
  * 加载镜头数据
  */
@@ -40,53 +94,48 @@ async function loadShots() {
         totalAllShots = data.total_all_global || data.total_all || data.total || 0;
         let filteredShotTypeCounts = data.shot_type_counts || {};
 
-        // ★ 当有视频源筛选时，需要基于选中视频源重新计算各项计数
+        // ★ 当有视频源筛选时，利用后端返回的 per_video_counts 重新计算各项计数
+        // 不再额外发起 API 请求
         if (sourceVideoFilters.size > 0) {
-            // ★ 侧边栏"全部镜头"始终显示已勾选视频源的总镜头数（不受收藏/搜索/景别筛选影响）
-            // 当有收藏/搜索筛选时，需要额外请求全量数据；否则可复用当前数据
-            let globalFiltered;
-            if (favoriteOnly || searchQuery) {
-                const globalData = await API.getShots({ sort: currentSort });
-                globalFiltered = (globalData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-            } else if (!shotTypeFilter) {
-                // 无任何筛选 → 当前 data.shots 就是全量数据，直接复用
-                globalFiltered = (data.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-            } else {
-                // 仅有景别筛选 → 后端 total_all_global 是全量，但需前端按视频源过滤
-                // data.shots 受景别筛选影响不完整，需要额外请求
-                const globalData = await API.getShots({ sort: currentSort });
-                globalFiltered = (globalData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-            }
-            totalAllShots = globalFiltered.length;
-            totalFavorites = globalFiltered.filter(s => s.favorite).length;
+            const pvc = data.per_video_counts || {};
+            let videoTotal = 0;
+            let videoFavTotal = 0;
+            const videoTypeCounts = {};
 
-            if (!shotTypeFilter) {
-                // 没有景别筛选 → 当前请求的 shots 就是全量（仅受收藏/搜索筛选）
-                // 前端过滤后直接统计
-                const allFiltered = (data.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-                filteredTotalAll = allFiltered.length;
+            for (const vpath of sourceVideoFilters) {
+                const counts = pvc[vpath];
+                if (!counts) continue;
+                videoTotal += counts.total || 0;
+                videoFavTotal += counts.favorite || 0;
+                if (counts.types) {
+                    for (const [st, n] of Object.entries(counts.types)) {
+                        videoTypeCounts[st] = (videoTypeCounts[st] || 0) + n;
+                    }
+                }
+            }
+
+            // 侧边栏"全部镜头"= 已勾选视频源的镜头总数
+            totalAllShots = videoTotal;
+            totalFavorites = videoFavTotal;
+
+            // 分类标签计数（基于已选视频源的全量数据）
+            // 如果有收藏/搜索筛选，则 filteredTotalAll 用当前 shots 长度（已由后端筛选）
+            if (favoriteOnly || searchQuery) {
+                filteredTotalAll = shots.length;
                 filteredShotTypeCounts = {};
-                for (const s of allFiltered) {
+                for (const s of shots) {
                     const st = s.shot_type || '';
                     if (st) {
                         filteredShotTypeCounts[st] = (filteredShotTypeCounts[st] || 0) + 1;
                     }
                 }
+            } else if (!shotTypeFilter) {
+                filteredTotalAll = videoTotal;
+                filteredShotTypeCounts = videoTypeCounts;
             } else {
-                // 有景别筛选 → 需要额外请求不带景别筛选的全量数据来统计各分类计数
-                const allParams = { sort: currentSort };
-                if (favoriteOnly) allParams.favorite_only = true;
-                if (searchQuery) allParams.search = searchQuery;
-                const allData = await API.getShots(allParams);
-                const allFiltered = (allData.shots || []).filter(s => sourceVideoFilters.has(s.source_video));
-                filteredTotalAll = allFiltered.length;
-                filteredShotTypeCounts = {};
-                for (const s of allFiltered) {
-                    const st = s.shot_type || '';
-                    if (st) {
-                        filteredShotTypeCounts[st] = (filteredShotTypeCounts[st] || 0) + 1;
-                    }
-                }
+                // 有景别筛选 → 分类标签基准应不受景别筛选影响
+                filteredTotalAll = videoTotal;
+                filteredShotTypeCounts = videoTypeCounts;
             }
         }
 
@@ -170,13 +219,13 @@ function renderGrid() {
                 <div class="shot-thumb">
                     <!-- 高斯模糊背景层 -->
                     <div class="shot-thumb-blur">
-                        <img src="${frameUrl}" alt="" loading="lazy">
+                        <img src="${frameUrl}" alt="" loading="lazy" onerror="this.style.opacity='0'">
                     </div>
                     <!-- 主缩略图（contain 不裁剪） -->
                     <img src="${frameUrl}" 
                          alt="Shot ${shot.index}" 
                          loading="lazy"
-                         onerror="this.style.display='none'">
+                         onerror="handleFrameError(this, '${shot.id}', '${shot.frame_file}')">
 
                     <!-- 常驻勾选框（左上角） -->
                     <div class="shot-check-persistent ${isSelected ? 'checked' : ''}" 

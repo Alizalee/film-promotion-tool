@@ -217,38 +217,20 @@ async def get_shot_video(shot_id: str):
     final_output = output_path_versioned if not os.path.exists(output_path) else output_path
 
     if not os.path.exists(final_output):
-        # 精确裁剪：使用双 -ss 策略，避免关键帧偏移导致导出到前后镜头的帧
-        safe_start = max(0, start_time - 5)
-        offset = round(start_time - safe_start, 6)
+        # 精确裁剪：使用统一的 clip_video_segment
+        from services.clip_service import clip_video_segment
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(safe_start),
-            "-i", video_path,
-            "-ss", str(offset),
-            "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-avoid_negative_ts", "make_zero",
-            final_output,
-        ]
+        success, err_msg = await clip_video_segment(
+            video_path=video_path,
+            output_path=final_output,
+            start_time=start_time,
+            duration=duration,
+        )
 
-        def _run_ffmpeg():
-            return subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        result = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg)
-
-        if result.returncode != 0:
+        if not success:
             raise HTTPException(
                 status_code=500,
-                detail=f"FFmpeg 裁剪失败: {result.stderr.decode(errors='replace')[:200]}",
+                detail=f"FFmpeg 裁剪失败: {err_msg}",
             )
 
     return FileResponse(
@@ -340,33 +322,15 @@ async def get_shot_video_range(shot_id: str, request: Request):
     final_output = output_path_versioned if not os.path.exists(output_path) else output_path
 
     if not os.path.exists(final_output):
-        # 精确裁剪：使用双 -ss 策略，避免关键帧偏移导致导出到前后镜头的帧
-        safe_start = max(0, start_time - 5)
-        offset = round(start_time - safe_start, 6)
+        # 精确裁剪：使用统一的 clip_video_segment
+        from services.clip_service import clip_video_segment as _clip_range
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(safe_start),
-            "-i", video_path,
-            "-ss", str(offset),
-            "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-avoid_negative_ts", "make_zero",
-            final_output,
-        ]
-
-        def _run_ffmpeg_range():
-            return subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-        await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg_range)
+        await _clip_range(
+            video_path=video_path,
+            output_path=final_output,
+            start_time=start_time,
+            duration=duration,
+        )
 
     if not os.path.exists(final_output):
         raise HTTPException(status_code=500, detail="无法生成镜头视频")

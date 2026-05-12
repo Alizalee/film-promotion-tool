@@ -24,34 +24,8 @@ router = APIRouter()
 _last_export_dir: Optional[str] = None
 
 # ── FFmpeg 自动发现 ──────────────────────────────────────────────
-_FFMPEG_SEARCH_PATHS = [
-    r"D:\Ae Plug-ins Suite\Scripts\ScriptUI Panels",
-    r"C:\ffmpeg\bin",
-    r"C:\Program Files\ffmpeg\bin",
-    r"C:\Program Files (x86)\ffmpeg\bin",
-    os.path.expanduser(r"~\ffmpeg\bin"),
-]
-
-
-def _find_ffmpeg() -> str:
-    """
-    返回可用的 ffmpeg 可执行文件路径。
-    优先使用系统 PATH 中的 ffmpeg，找不到则搜索常见安装路径。
-    """
-    # 1. 系统 PATH 中已有
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-
-    # 2. 搜索常见路径
-    for search_dir in _FFMPEG_SEARCH_PATHS:
-        candidate = os.path.join(search_dir, "ffmpeg.exe")
-        if os.path.isfile(candidate):
-            # 将该目录加入当前进程的 PATH，后续调用就不用再搜了
-            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + search_dir
-            return candidate
-
-    return ""
+# 使用统一的 clip_service 模块
+from services.clip_service import find_ffmpeg as _find_ffmpeg, clip_video_segment
 
 
 class ExportDownloadRequest(BaseModel):
@@ -253,38 +227,19 @@ async def _export_shot_to_dir(shot: dict, output_dir: str, shots_dir: str) -> di
 
             start_time = shot["start_time"]
             duration = shot["duration"]
-            safe_start = max(0, start_time - 5)
-            offset = round(start_time - safe_start, 6)
 
-            cmd = [
-                ffmpeg_bin, "-y",
-                "-ss", str(safe_start),
-                "-i", video_path,
-                "-ss", str(offset),
-                "-t", str(duration),
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "18",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-avoid_negative_ts", "make_zero",
-                output_path,
-            ]
+            success, err_msg = await clip_video_segment(
+                video_path=video_path,
+                output_path=output_path,
+                start_time=start_time,
+                duration=duration,
+                ffmpeg_bin=ffmpeg_bin,
+            )
 
-            # 使用 subprocess.run 在线程池中执行，避免 Windows asyncio 子进程兼容性问题
-            def _run_ffmpeg():
-                return subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-            result = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg)
-
-            if result.returncode == 0:
+            if success:
                 return {"shot_id": shot_id, "filename": output_filename, "path": output_path}
             else:
-                return {"shot_id": shot_id, "error": f"FFmpeg 错误: {result.stderr.decode(errors='replace')[:200]}"}
+                return {"shot_id": shot_id, "error": f"FFmpeg 错误: {err_msg}"}
         else:
             shutil.copy2(clip_path, output_path)
             return {"shot_id": shot_id, "filename": output_filename, "path": output_path}
